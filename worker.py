@@ -9,6 +9,7 @@ import asyncio
 import os
 import sys
 import random
+import re
 import uuid
 import platform
 import socket
@@ -143,6 +144,123 @@ def load_config(sb):
         "batch_size": 30,
         "batch_rest_seconds": 180,
     }
+
+
+# ── IP 로테이션 (테더링) ─────────────────────────
+def _get_external_ip():
+    """외부 IP 주소를 조회 (실패 시 None)"""
+    try:
+        import urllib.request
+        with urllib.request.urlopen("https://api.ipify.org", timeout=10) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return None
+
+
+def _get_windows_wifi_profile():
+    """Windows에서 현재 연결된 Wi-Fi 프로필 이름을 반환"""
+    try:
+        result = subprocess.run(
+            ["netsh", "wlan", "show", "interfaces"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            # "Profile" 또는 "프로필" 행에서 값 추출
+            if "Profile" in line or "프로필" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    profile = parts[1].strip()
+                    if profile:
+                        return profile
+    except Exception:
+        pass
+    return None
+
+
+def rotate_tethering_ip(config, log_cb=None):
+    """테더링 IP 로테이션 — Wi-Fi 끊고 재연결하여 새 IP 할당"""
+    system = platform.system()
+    old_ip = _get_external_ip()
+    if log_cb:
+        log_cb(f"\n  🔄 IP 로테이션 시작 (현재 IP: {old_ip or '확인 불가'})")
+
+    try:
+        if system == "Darwin":
+            # Mac: Wi-Fi 끄고 켜기
+            if log_cb:
+                log_cb("     Wi-Fi OFF (en0)...")
+            subprocess.run(
+                ["networksetup", "-setairportpower", "en0", "off"],
+                capture_output=True, timeout=10,
+            )
+            import time
+            time.sleep(5)
+            if log_cb:
+                log_cb("     Wi-Fi ON (en0)...")
+            subprocess.run(
+                ["networksetup", "-setairportpower", "en0", "on"],
+                capture_output=True, timeout=10,
+            )
+            # 재연결 대기
+            reconnect_wait = config.get("tethering_reconnect_interval", 15)
+            if log_cb:
+                log_cb(f"     재연결 대기 {reconnect_wait}초...")
+            time.sleep(reconnect_wait)
+
+        elif system == "Windows":
+            # Windows: Wi-Fi 끊고 재연결
+            profile = _get_windows_wifi_profile()
+            if not profile:
+                if log_cb:
+                    log_cb("     ⚠️ Wi-Fi 프로필을 찾을 수 없습니다")
+                return False
+
+            if log_cb:
+                log_cb(f"     Wi-Fi 연결 해제 (프로필: {profile})...")
+            subprocess.run(
+                ["netsh", "wlan", "disconnect"],
+                capture_output=True, timeout=10,
+            )
+            import time
+            time.sleep(5)
+            if log_cb:
+                log_cb(f"     Wi-Fi 재연결 (프로필: {profile})...")
+            subprocess.run(
+                ["netsh", "wlan", "connect", f"name={profile}"],
+                capture_output=True, timeout=10,
+            )
+            reconnect_wait = config.get("tethering_reconnect_interval", 15)
+            if log_cb:
+                log_cb(f"     재연결 대기 {reconnect_wait}초...")
+            time.sleep(reconnect_wait)
+
+        else:
+            if log_cb:
+                log_cb(f"     ⚠️ 지원하지 않는 OS: {system}")
+            return False
+
+    except Exception as e:
+        if log_cb:
+            log_cb(f"     ❌ IP 로테이션 실패: {e}")
+        return False
+
+    new_ip = _get_external_ip()
+    if log_cb:
+        log_cb(f"     새 IP: {new_ip or '확인 불가'}")
+        if old_ip and new_ip and old_ip != new_ip:
+            log_cb("     ✅ IP 변경 성공")
+        elif old_ip and new_ip and old_ip == new_ip:
+            log_cb("     ⚠️ IP가 변경되지 않았습니다")
+
+    return True
+
+
+def should_rotate_ip(config):
+    """config 기반으로 IP 로테이션이 필요한지 판단"""
+    network_type = config.get("network_type", "")
+    if network_type.startswith("tethering_") and config.get("tethering_auto_reconnect", False):
+        return True
+    return False
 
 
 # ── 업데이트 체크 ─────────────────────────────
@@ -375,8 +493,16 @@ async def main():
 
     # Config 로드
     config = load_config(sb)
+    network_type = config.get("network_type", "direct")
     print(f"  ⚙️ Config 로드 (배치: {config.get('batch_size', 30)}개, "
           f"딜레이: {config.get('keyword_delay_min', 15)}~{config.get('keyword_delay_max', 30)}초)")
+    if should_rotate_ip(config):
+        print(f"  🔄 IP 로테이션 활성 (네트워크: {network_type}, "
+              f"재연결 간격: {config.get('tethering_reconnect_interval', 15)}초)")
+    elif network_type == "proxy_rotate":
+        print(f"  🌐 프록시 로테이션 (프록시 서비스에서 자동 처리)")
+    else:
+        print(f"  🌐 네트워크: {network_type}")
 
     heartbeat(sb, "idle")
 
@@ -425,6 +551,9 @@ async def main():
                 await asyncio.sleep(rest)
                 batch_count = 0
                 config = load_config(sb)  # config 재로드
+                # IP 로테이션
+                if should_rotate_ip(config):
+                    rotate_tethering_ip(config, log_cb=print)
             else:
                 delay_min = config.get("keyword_delay_min", 15)
                 delay_max = config.get("keyword_delay_max", 30)
@@ -489,6 +618,9 @@ async def main():
                     await asyncio.sleep(rest)
                     batch_count = 0
                     config = load_config(sb)  # config 재로드
+                    # IP 로테이션
+                    if should_rotate_ip(config):
+                        rotate_tethering_ip(config, log_cb=print)
                 else:
                     delay_min = config.get("keyword_delay_min", 15)
                     delay_max = config.get("keyword_delay_max", 30)
