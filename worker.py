@@ -17,7 +17,7 @@ import subprocess
 from datetime import datetime, timezone
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -300,7 +300,7 @@ async def process_request(sb, req, config, log_cb=None):
     heartbeat(sb, "crawling", keyword, req_type)
 
     try:
-        handler = handler_cls(headless=True)
+        handler = handler_cls(headless=True, config=config)
         results = await handler.handle(keyword, options, log_cb=log_cb)
 
         if results:
