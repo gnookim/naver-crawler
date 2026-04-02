@@ -33,7 +33,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.8.4"
+VERSION = "0.9.0"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -371,15 +371,8 @@ def apply_update(sb, release):
     }).eq("id", WORKER_ID).execute()
 
     print(f"   ✅ {updated}개 파일 업데이트 완료")
-
-    # 즉시 재시작 (os.execv — 메모리의 옛 코드를 우회)
-    python = sys.executable
-    worker_script = os.path.join(WORKER_DIR, "worker.py")
-    print("\n🔄 재시작합니다...")
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os.execv(python, [python, worker_script])
-    # os.execv 이후 코드는 실행되지 않음
+    print(f"   다음 폴링 주기에 새 코드가 자동 반영됩니다.")
+    return True
 
 
 def restart_worker():
@@ -457,7 +450,7 @@ def handle_command(sb, command):
         update = check_update(sb)
         if update:
             if apply_update(sb, update):
-                restart_worker()
+                pass  # 재시작 불필요 — 파일 갱신만
             else:
                 print("   ⚠️ 업데이트 적용 실패")
         else:
@@ -705,7 +698,12 @@ async def main():
         print(f"\n  📦 새 버전 발견: v{update['version']} (현재: v{VERSION})")
         print(f"     {update.get('changelog', '')}")
         if apply_update(sb, update):
-            restart_worker()  # 자동 재시작
+            # 시작 시에만 os.execv 재시작 (아직 메인 루프 전)
+            python = sys.executable
+            worker_script = os.path.join(WORKER_DIR, "worker.py")
+            print("   재시작합니다...")
+            sys.stdout.flush()
+            os.execv(python, [python, worker_script])
     else:
         print("  ✅ 최신 버전")
 
@@ -781,6 +779,7 @@ async def main():
 
     batch_count = 0
     loop_count = 0
+    _pending_restart = False
     while True:
         try:
             heartbeat(sb, "idle")
@@ -798,7 +797,8 @@ async def main():
                 if update:
                     print(f"\n  📦 새 버전 v{update['version']} 발견 — 자동 업데이트")
                     if apply_update(sb, update):
-                        restart_worker()
+                        # 배치 휴식 시점에 재시작 (메인 루프 중단 없이)
+                        _pending_restart = True
 
                 # config 주기적 재로드 (quota 등 반영)
                 config = load_config(sb)
@@ -877,6 +877,14 @@ async def main():
                     pass
 
                 if batch_count >= config.get("batch_size", 30):
+                    # 업데이트 대기 중이면 배치 휴식 시점에 재시작
+                    if _pending_restart:
+                        print("\n  🔄 업데이트 적용을 위해 재시작합니다...")
+                        python = sys.executable
+                        worker_script = os.path.join(WORKER_DIR, "worker.py")
+                        sys.stdout.flush()
+                        os.execv(python, [python, worker_script])
+
                     rest = config.get("batch_rest_seconds", 180)
                     print(f"\n  😴 배치 완료 — {rest}초 휴식")
                     await asyncio.sleep(rest)
