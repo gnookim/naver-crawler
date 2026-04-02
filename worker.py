@@ -33,7 +33,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -329,6 +329,15 @@ def apply_update(sb, release):
     files = release.get("files") or {}
     print(f"\n🔄 업데이트 v{VERSION} → v{new_version}")
     print(f"   {release.get('changelog', '')}")
+
+    # __pycache__ 삭제 (오래된 캐시가 새 모듈 import를 방해)
+    for root, dirs, _files in os.walk(WORKER_DIR):
+        for d in dirs:
+            if d == "__pycache__":
+                try:
+                    shutil.rmtree(os.path.join(root, d))
+                except Exception:
+                    pass
 
     # 파일 업데이트 — __init__.py와 worker.py는 마지막에 쓰기
     # (새 import가 추가된 __init__.py가 먼저 쓰이면 아직 없는 모듈 import 에러)
