@@ -18,7 +18,7 @@ import subprocess
 from datetime import datetime, timezone
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -40,6 +40,35 @@ WORKER_ID = os.environ.get("WORKER_ID", "")
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 from handlers import HANDLERS
+
+# ── SSO 연동 (옵션) ───────────────────────────────
+SSO_EMAIL = os.environ.get("SSO_EMAIL", "")
+SSO_PASSWORD = os.environ.get("SSO_PASSWORD", "")
+_sso_enabled = False
+
+def init_sso():
+    """SSO 로그인 시도. 실패해도 크롤링에는 영향 없음."""
+    global _sso_enabled
+    if not SSO_EMAIL or not SSO_PASSWORD:
+        return False
+    try:
+        from lifenbio_auth import login
+        login(SSO_EMAIL, SSO_PASSWORD, app_id="naver-crawler")
+        _sso_enabled = True
+        return True
+    except Exception as e:
+        print(f"  ⚠️ SSO 로그인 실패 (무시됨): {e}")
+        return False
+
+def sso_log(action: str, metadata: dict = {}):
+    """SSO 사용 기록 전송. 실패해도 무시."""
+    if not _sso_enabled:
+        return
+    try:
+        from lifenbio_auth import log_activity
+        log_activity(action, metadata)
+    except Exception:
+        pass
 
 # 최근 처리한 작업 ID (무한루프 방지)
 _processed_ids: set = set()
@@ -286,9 +315,21 @@ def apply_update(sb, release):
     print(f"\n🔄 업데이트 v{VERSION} → v{new_version}")
     print(f"   {release.get('changelog', '')}")
 
-    # 파일 업데이트 (files = {"worker.py": "내용", "handlers/blog.py": "내용", ...})
+    # 파일 업데이트 — __init__.py와 worker.py는 마지막에 쓰기
+    # (새 import가 추가된 __init__.py가 먼저 쓰이면 아직 없는 모듈 import 에러)
     updated = 0
+    deferred = {}
     for filepath, content in files.items():
+        if filepath.endswith("__init__.py") or filepath == "worker.py":
+            deferred[filepath] = content
+            continue
+        target = os.path.join(WORKER_DIR, filepath)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+        updated += 1
+        print(f"   ✅ {filepath}")
+    for filepath, content in deferred.items():
         target = os.path.join(WORKER_DIR, filepath)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as f:
@@ -438,6 +479,11 @@ async def process_request(sb, req, config, log_cb=None):
 
         if log_cb: log_cb(f"  ✅ 완료: {len(results)}개")
 
+        sso_log("crawl.completed", {
+            "keyword": keyword, "type": req_type,
+            "result_count": len(results), "worker_id": WORKER_ID,
+        })
+
         # 서브태스크 완료 시 부모 요청 상태 체크
         parent_id = req.get("parent_id")
         if parent_id:
@@ -450,6 +496,11 @@ async def process_request(sb, req, config, log_cb=None):
             "error_message": str(e)[:500],
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", req_id).execute()
+
+        sso_log("crawl.failed", {
+            "keyword": keyword, "type": req_type,
+            "error": str(e)[:200], "worker_id": WORKER_ID,
+        })
 
     sb.table("workers").update({
         "current_task_id": None,
@@ -511,6 +562,13 @@ async def main():
         print("  ✅ CrawlStation에 등록 완료")
     else:
         print("  ⚠️ 등록 실패 — 오프라인 모드로 실행")
+
+    # SSO 로그인
+    if init_sso():
+        print("  🔐 SSO 로그인 완료")
+    elif SSO_EMAIL:
+        print("  ⚠️ SSO 로그인 실패")
+    sso_log("worker.started", {"worker_id": WORKER_ID, "version": VERSION})
 
     # 시작 시 자동 업데이트 (묻지 않음)
     update = check_update(sb)
