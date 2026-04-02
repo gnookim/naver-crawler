@@ -15,10 +15,11 @@ import platform
 import socket
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
