@@ -19,7 +19,7 @@ import time
 from datetime import datetime, timezone
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -608,8 +608,15 @@ async def main():
     # 워커 ID 확인/생성
     ensure_worker_id()
 
-    from supabase import create_client
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("  📦 Supabase SDK 사용")
+    except (ImportError, OSError) as e:
+        # greenlet DLL 에러 등 → REST API fallback
+        from supabase_rest import SupabaseREST
+        sb = SupabaseREST(SUPABASE_URL, SUPABASE_KEY)
+        print(f"  📦 Supabase REST fallback (SDK 로드 실패: {str(e)[:60]})")
 
     # CrawlStation에 자동 등록
     info = collect_machine_info()
