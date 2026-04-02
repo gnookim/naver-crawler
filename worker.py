@@ -18,7 +18,7 @@ import subprocess
 from datetime import datetime, timezone
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -477,9 +477,37 @@ async def process_request(sb, req, config, log_cb=None):
 
     heartbeat(sb, "crawling", keyword, req_type)
 
+    _t0 = time.time()
+    _meta = {
+        "worker_id": WORKER_ID,
+        "request_id": req_id,
+        "keyword": keyword,
+        "type": req_type,
+        "blocked": False,
+        "captcha": False,
+        "empty_result": False,
+        "error_type": None,
+        "result_count": 0,
+        "response_time_ms": 0,
+    }
+
     try:
         handler = handler_cls(headless=True, config=config)
         results = await handler.handle(keyword, options, log_cb=log_cb)
+
+        _meta["response_time_ms"] = int((time.time() - _t0) * 1000)
+        _meta["result_count"] = len(results) if results else 0
+        _meta["empty_result"] = _meta["result_count"] == 0
+
+        # 차단/캡챠 감지 (결과에서)
+        if results:
+            for item in results:
+                item_str = str(item).lower()
+                if "captcha" in item_str or "보안문자" in item_str:
+                    _meta["captcha"] = True
+                    _meta["blocked"] = True
+                if "차단" in item_str or "blocked" in item_str:
+                    _meta["blocked"] = True
 
         if results:
             rows = [{
@@ -496,7 +524,7 @@ async def process_request(sb, req, config, log_cb=None):
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", req_id).execute()
 
-        if log_cb: log_cb(f"  ✅ 완료: {len(results)}개")
+        if log_cb: log_cb(f"  ✅ 완료: {len(results)}개 ({_meta['response_time_ms']}ms)")
 
         sso_log("crawl.completed", {
             "keyword": keyword, "type": req_type,
@@ -509,6 +537,15 @@ async def process_request(sb, req, config, log_cb=None):
             _check_parent_completion(sb, parent_id, log_cb)
 
     except Exception as e:
+        _meta["response_time_ms"] = int((time.time() - _t0) * 1000)
+        _meta["error_type"] = type(e).__name__
+        err_str = str(e).lower()
+        if "captcha" in err_str or "보안문자" in err_str:
+            _meta["captcha"] = True
+            _meta["blocked"] = True
+        if "timeout" in err_str or "navigation" in err_str:
+            _meta["blocked"] = True
+
         if log_cb: log_cb(f"  ❌ 오류: {e}")
         sb.table("crawl_requests").update({
             "status": "failed",
@@ -526,6 +563,12 @@ async def process_request(sb, req, config, log_cb=None):
         "current_keyword": None,
         "current_type": None,
     }).eq("id", WORKER_ID).execute()
+
+    # 메타데이터 기록 (AI 분석용)
+    try:
+        sb.table("crawl_metadata").insert(_meta).execute()
+    except Exception:
+        pass
 
     heartbeat(sb, "idle")
 
