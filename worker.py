@@ -33,7 +33,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.8.2"
+VERSION = "0.8.3"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -375,12 +375,22 @@ def apply_update(sb, release):
 
 
 def restart_worker():
-    """워커 프로세스 종료 → LaunchAgent/서비스가 자동 재시작"""
+    """워커를 os.execv로 직접 재시작 (프로세스 대체)"""
     print("\n🔄 워커 재시작 중...")
 
-    # 먼저 새 코드가 import 가능한지 검증
     python = sys.executable
     worker_script = os.path.join(WORKER_DIR, "worker.py")
+
+    # __pycache__ 삭제
+    for root, dirs, _files in os.walk(WORKER_DIR):
+        for d in dirs:
+            if d == "__pycache__":
+                try:
+                    shutil.rmtree(os.path.join(root, d))
+                except Exception:
+                    pass
+
+    # import 검증
     try:
         r = subprocess.run(
             [python, "-c", f"import sys; sys.path.insert(0, '{WORKER_DIR}'); from handlers import HANDLERS; print('OK', len(HANDLERS))"],
@@ -395,9 +405,11 @@ def restart_worker():
         print(f"   ⚠️ 검증 실패: {e}")
         return
 
-    # 프로세스 종료 (exit code 0이 아닌 값 → LaunchAgent/서비스가 재시작)
-    print("   프로세스 종료 → 서비스 매니저가 재시작합니다")
-    sys.exit(42)  # 비정상 종료 코드 → KeepAlive 트리거
+    # os.execv로 직접 재시작 (프로세스 대체 — PID 유지)
+    print("   재시작합니다...")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(python, [python, worker_script])
 
 
 # ── 원격 명령 체크 ────────────────────────────
