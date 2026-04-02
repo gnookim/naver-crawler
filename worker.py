@@ -351,10 +351,29 @@ def apply_update(sb, release):
 
 
 def restart_worker():
-    """worker.py를 자동 재실행"""
+    """워커 프로세스 종료 → LaunchAgent/서비스가 자동 재시작"""
     print("\n🔄 워커 재시작 중...")
+
+    # 먼저 새 코드가 import 가능한지 검증
     python = sys.executable
-    os.execv(python, [python, os.path.join(WORKER_DIR, "worker.py")])
+    worker_script = os.path.join(WORKER_DIR, "worker.py")
+    try:
+        r = subprocess.run(
+            [python, "-c", f"import sys; sys.path.insert(0, '{WORKER_DIR}'); from handlers import HANDLERS; print('OK', len(HANDLERS))"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            print(f"   ⚠️ 새 코드 import 실패 — 재시작 취소")
+            print(f"   {r.stderr[:300]}")
+            return
+        print(f"   ✅ import 검증 통과: {r.stdout.strip()}")
+    except Exception as e:
+        print(f"   ⚠️ 검증 실패: {e}")
+        return
+
+    # 프로세스 종료 (exit code 0이 아닌 값 → LaunchAgent/서비스가 재시작)
+    print("   프로세스 종료 → 서비스 매니저가 재시작합니다")
+    sys.exit(42)  # 비정상 종료 코드 → KeepAlive 트리거
 
 
 # ── 원격 명령 체크 ────────────────────────────
