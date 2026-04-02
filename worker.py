@@ -33,7 +33,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -376,7 +376,7 @@ def apply_update(sb, release):
 
 
 def restart_worker():
-    """워커를 os.execv로 직접 재시작 (프로세스 대체)"""
+    """워커 재시작 — 새 프로세스를 백그라운드로 시작하고 자기는 종료"""
     print("\n🔄 워커 재시작 중...")
 
     python = sys.executable
@@ -391,26 +391,25 @@ def restart_worker():
                 except Exception:
                     pass
 
-    # import 검증
+    # 새 프로세스를 백그라운드로 시작
     try:
-        r = subprocess.run(
-            [python, "-c", f"import sys; sys.path.insert(0, '{WORKER_DIR}'); from handlers import HANDLERS; print('OK', len(HANDLERS))"],
-            capture_output=True, text=True, timeout=10,
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        subprocess.Popen(
+            [python, worker_script],
+            cwd=WORKER_DIR,
+            env=env,
+            stdout=open(os.path.join(WORKER_DIR, "logs", "worker.log"), "a"),
+            stderr=open(os.path.join(WORKER_DIR, "logs", "worker.err"), "a"),
+            start_new_session=True,
         )
-        if r.returncode != 0:
-            print(f"   ⚠️ 새 코드 import 실패 — 재시작 취소")
-            print(f"   {r.stderr[:300]}")
-            return
-        print(f"   ✅ import 검증 통과: {r.stdout.strip()}")
+        print("   새 프로세스 시작됨")
     except Exception as e:
-        print(f"   ⚠️ 검증 실패: {e}")
+        print(f"   ⚠️ 새 프로세스 시작 실패: {e}")
         return
 
-    # os.execv로 직접 재시작 (프로세스 대체 — PID 유지)
-    print("   재시작합니다...")
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os.execv(python, [python, worker_script])
+    # 자기 종료 (새 프로세스가 이미 떠있으므로 안전)
+    sys.exit(0)
 
 
 # ── 원격 명령 체크 ────────────────────────────
@@ -692,18 +691,13 @@ async def main():
         print("  ⚠️ SSO 로그인 실패")
     sso_log("worker.started", {"worker_id": WORKER_ID, "version": VERSION})
 
-    # 시작 시 자동 업데이트 (묻지 않음)
+    # 시작 시 자동 업데이트 (파일만 갱신, 재시작 안 함)
     update = check_update(sb)
     if update:
         print(f"\n  📦 새 버전 발견: v{update['version']} (현재: v{VERSION})")
         print(f"     {update.get('changelog', '')}")
-        if apply_update(sb, update):
-            # 시작 시에만 os.execv 재시작 (아직 메인 루프 전)
-            python = sys.executable
-            worker_script = os.path.join(WORKER_DIR, "worker.py")
-            print("   재시작합니다...")
-            sys.stdout.flush()
-            os.execv(python, [python, worker_script])
+        apply_update(sb, update)
+        print("  ✅ 파일 갱신 완료 (다음 배치 휴식 시 반영)")
     else:
         print("  ✅ 최신 버전")
 
@@ -880,10 +874,7 @@ async def main():
                     # 업데이트 대기 중이면 배치 휴식 시점에 재시작
                     if _pending_restart:
                         print("\n  🔄 업데이트 적용을 위해 재시작합니다...")
-                        python = sys.executable
-                        worker_script = os.path.join(WORKER_DIR, "worker.py")
-                        sys.stdout.flush()
-                        os.execv(python, [python, worker_script])
+                        restart_worker()  # 새 프로세스 시작 + 자기 종료
 
                     rest = config.get("batch_rest_seconds", 180)
                     print(f"\n  😴 배치 완료 — {rest}초 휴식")
