@@ -18,7 +18,7 @@ import subprocess
 from datetime import datetime, timezone
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -693,6 +693,16 @@ async def main():
                 # config 주기적 재로드 (quota 등 반영)
                 config = load_config(sb)
 
+            # ── 새벽 휴식 (KST 3~5시) ──
+            kst_now = datetime.now(timezone.utc).astimezone()
+            kst_hour = (kst_now.hour + 9) % 24  # UTC → KST 간이 변환
+            rest_hours = config.get("rest_hours", [3, 4, 5])
+            if kst_hour in rest_hours:
+                if loop_count % 60 == 1:  # 5분마다 로그
+                    print(f"  😴 새벽 휴식 중 (KST {kst_hour}시) — 작업 중단")
+                await asyncio.sleep(60)
+                continue
+
             # ── 일일 할당량 체크 ──
             daily_quota = config.get("daily_quota", 500)
             daily_used = config.get("daily_used", 0)
@@ -769,6 +779,21 @@ async def main():
                     delay_min = config.get("keyword_delay_min", 15)
                     delay_max = config.get("keyword_delay_max", 30)
                     await asyncio.sleep(random.randint(delay_min, delay_max))
+
+                    # decoy 검색 (15% 확률 — 목적 없는 일반 검색으로 패턴 위장)
+                    if random.random() < 0.15:
+                        try:
+                            from playwright.async_api import async_playwright
+                            from handlers.base import BaseCrawler
+                            bc = BaseCrawler(headless=True, config=config)
+                            async with async_playwright() as pw:
+                                browser, ctx = await bc.create_browser(pw)
+                                page = await ctx.new_page()
+                                await bc.decoy_search(page)
+                                await browser.close()
+                            print("  🎭 decoy 검색 완료")
+                        except Exception:
+                            pass
             else:
                 await asyncio.sleep(5)
 

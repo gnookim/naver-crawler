@@ -202,6 +202,37 @@ class BaseCrawler:
             except Exception:
                 pass
 
+    # 무작위 decoy 검색 키워드 (다양한 관심사)
+    DECOY_QUERIES = [
+        "오늘 날씨", "맛집 추천", "영화 순위", "주식 시세", "아이폰 케이스",
+        "여행 추천", "다이어트 방법", "운동 루틴", "카페 추천", "신차 가격",
+        "반려견 사료", "헤어스타일 남자", "맥북 할인", "전세 매물", "이직 준비",
+        "치킨 배달", "넷플릭스 추천", "헬스장 가격", "한강 공원", "가성비 이어폰",
+        "생일 선물", "주말 나들이", "인테리어 비용", "자취 꿀팁", "연말정산",
+    ]
+
+    async def decoy_search(self, page):
+        """목적 없는 검색 — 분석 대상이 아닌 일반 검색으로 패턴 위장"""
+        query = random.choice(self.DECOY_QUERIES)
+        try:
+            await page.goto("https://www.naver.com", wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(random.randint(500, 1500))
+            si = await page.query_selector("#query, #search, input[name='query']")
+            if si:
+                await si.click()
+                await si.fill("")
+                for ch in query:
+                    await page.keyboard.type(ch, delay=random.randint(50, 150))
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(random.randint(1500, 3000))
+                await self.human_scroll(page, times=random.randint(2, 4))
+                # 가끔 결과 클릭
+                if random.random() < 0.3:
+                    await self.click_random_result(page)
+                await page.wait_for_timeout(random.randint(500, 2000))
+        except Exception:
+            pass
+
     async def human_search(self, page, query, where=None):
         """사람처럼 네이버 검색 — 워밍업 + 타이핑 + 오타 + 랜덤 클릭"""
         # 워밍업 (세션 생성)
