@@ -33,7 +33,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.8.3"
+VERSION = "0.8.4"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -371,7 +371,15 @@ def apply_update(sb, release):
     }).eq("id", WORKER_ID).execute()
 
     print(f"   ✅ {updated}개 파일 업데이트 완료")
-    return True
+
+    # 즉시 재시작 (os.execv — 메모리의 옛 코드를 우회)
+    python = sys.executable
+    worker_script = os.path.join(WORKER_DIR, "worker.py")
+    print("\n🔄 재시작합니다...")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(python, [python, worker_script])
+    # os.execv 이후 코드는 실행되지 않음
 
 
 def restart_worker():
