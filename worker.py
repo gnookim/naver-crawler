@@ -582,6 +582,35 @@ async def main():
                     if apply_update(sb, update):
                         restart_worker()
 
+                # config 주기적 재로드 (quota 등 반영)
+                config = load_config(sb)
+
+            # ── 일일 할당량 체크 ──
+            daily_quota = config.get("daily_quota", 500)
+            daily_used = config.get("daily_used", 0)
+            quota_reset_at = config.get("quota_reset_at", "")
+
+            # KST 자정 리셋 체크
+            if quota_reset_at:
+                try:
+                    from datetime import date as _date
+                    reset_date = _date.fromisoformat(quota_reset_at[:10])
+                    # KST = UTC+9
+                    kst_now = datetime.now(timezone.utc).astimezone()
+                    kst_today = kst_now.date()
+                    if reset_date < kst_today:
+                        sb.rpc("reset_daily_quota_if_needed", {"wid": WORKER_ID}).execute()
+                        daily_used = 0
+                        config["daily_used"] = 0
+                except Exception:
+                    pass
+
+            if daily_used >= daily_quota:
+                if loop_count % 12 == 1:  # 1분마다 로그
+                    print(f"  ⏸️ 일일 할당량 소진 ({daily_used}/{daily_quota}) — 대기 중")
+                await asyncio.sleep(60)
+                continue
+
             # 1) 내게 할당된 작업
             res = sb.table("crawl_requests").select("*") \
                 .eq("assigned_worker", WORKER_ID) \
@@ -611,6 +640,13 @@ async def main():
             if task:
                 await process_request(sb, task, config, log_cb=print)
                 batch_count += 1
+
+                # 일일 사용량 increment (atomic)
+                try:
+                    sb.rpc("increment_daily_used", {"wid": WORKER_ID}).execute()
+                    config["daily_used"] = config.get("daily_used", 0) + 1
+                except Exception:
+                    pass
 
                 if batch_count >= config.get("batch_size", 30):
                     rest = config.get("batch_rest_seconds", 180)
