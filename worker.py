@@ -625,6 +625,22 @@ async def main():
     else:
         print("  ⚠️ 등록 실패 — 오프라인 모드로 실행")
 
+    # 좀비 작업 정리 (내가 담당했지만 10분 이상 running인 작업)
+    try:
+        cutoff = (datetime.now(timezone.utc) - __import__('datetime').timedelta(minutes=10)).isoformat()
+        res = sb.table("crawl_requests") \
+            .update({"status": "failed", "error_message": "타임아웃 — 워커 재시작으로 자동 정리",
+                     "completed_at": datetime.now(timezone.utc).isoformat()}) \
+            .eq("assigned_worker", WORKER_ID) \
+            .eq("status", "running") \
+            .lt("started_at", cutoff) \
+            .execute()
+        cleaned = len(res.data) if res.data else 0
+        if cleaned:
+            print(f"  🧹 좀비 작업 {cleaned}개 정리")
+    except Exception:
+        pass
+
     # SSO 로그인
     if init_sso():
         print("  🔐 SSO 로그인 완료")
