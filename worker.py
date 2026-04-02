@@ -18,7 +18,7 @@ import subprocess
 from datetime import datetime, timezone
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -438,6 +438,11 @@ async def process_request(sb, req, config, log_cb=None):
 
         if log_cb: log_cb(f"  ✅ 완료: {len(results)}개")
 
+        # 서브태스크 완료 시 부모 요청 상태 체크
+        parent_id = req.get("parent_id")
+        if parent_id:
+            _check_parent_completion(sb, parent_id, log_cb)
+
     except Exception as e:
         if log_cb: log_cb(f"  ❌ 오류: {e}")
         sb.table("crawl_requests").update({
@@ -453,6 +458,32 @@ async def process_request(sb, req, config, log_cb=None):
     }).eq("id", WORKER_ID).execute()
 
     heartbeat(sb, "idle")
+
+
+def _check_parent_completion(sb, parent_id, log_cb=None):
+    """모든 서브태스크가 완료/실패되면 부모 요청도 완료 처리"""
+    try:
+        res = sb.table("crawl_requests").select("id, status") \
+            .eq("parent_id", parent_id).execute()
+        if not res.data:
+            return
+        statuses = [r["status"] for r in res.data]
+        # 아직 진행 중인 서브태스크가 있으면 대기
+        if any(s in ("pending", "assigned", "running") for s in statuses):
+            return
+        # 전체 실패 vs 부분 성공
+        if all(s == "failed" for s in statuses):
+            parent_status = "failed"
+        else:
+            parent_status = "completed"
+        sb.table("crawl_requests").update({
+            "status": parent_status,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", parent_id).execute()
+        if log_cb:
+            log_cb(f"  📦 부모 요청 {parent_status}: {parent_id[:8]}")
+    except Exception:
+        pass
 
 
 async def main():

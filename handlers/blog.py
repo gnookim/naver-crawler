@@ -61,7 +61,7 @@ class BlogCrawlHandler(BaseCrawler):
         result = {
             "title": link["title"], "url": url, "blogger": "",
             "body": "", "headings": [], "word_count": 0,
-            "image_count": 0, "image_alts": [], "has_video": False,
+            "image_count": 0, "has_video": False,
             "published_at": "", "link_count": {"internal": 0, "external": 0},
         }
 
@@ -82,7 +82,7 @@ class BlogCrawlHandler(BaseCrawler):
             post_data = await page.evaluate("""() => {
                 const result = {
                     title: '', blogger: '', body: '', headings: [],
-                    imageCount: 0, imageAlts: [], hasVideo: false, publishedAt: '',
+                    imageCount: 0, hasVideo: false, publishedAt: '',
                     internalLinks: 0, externalLinks: 0,
                 };
                 const titleEl = document.querySelector('.se-title-text, .pcol1, h3.se_textarea, .tit_h3');
@@ -104,12 +104,7 @@ class BlogCrawlHandler(BaseCrawler):
                         const txt = h.innerText.trim();
                         if (txt.length > 2 && txt.length < 100 && !seenH.has(txt)) { seenH.add(txt); result.headings.push(txt); }
                     });
-                    const imgs = bodyEl.querySelectorAll('img');
-                    result.imageCount = imgs.length;
-                    imgs.forEach(img => {
-                        const alt = (img.alt || '').trim();
-                        if (alt && alt !== 'image' && alt !== '이미지') result.imageAlts.push(alt);
-                    });
+                    result.imageCount = bodyEl.querySelectorAll('img').length;
                     result.hasVideo = bodyEl.querySelector('video, iframe[src*="youtube"], iframe[src*="tv.naver"], .se-video') !== null;
                     bodyEl.querySelectorAll('a[href]').forEach(a => {
                         const href = a.href || '';
@@ -130,7 +125,6 @@ class BlogCrawlHandler(BaseCrawler):
             result["word_count"] = len(post_data.get("body", ""))
             if need_headings: result["headings"] = post_data.get("headings", [])
             result["image_count"] = post_data.get("imageCount", 0)
-            result["image_alts"] = post_data.get("imageAlts", [])
             result["has_video"] = post_data.get("hasVideo", False)
             result["published_at"] = post_data.get("publishedAt", "")
             result["link_count"] = {
