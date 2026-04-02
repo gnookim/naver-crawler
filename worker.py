@@ -18,8 +18,22 @@ import subprocess
 import time
 from datetime import datetime, timezone
 
+# greenlet DLL 호환성 문제 우회 (Windows embedded Python)
+# playwright async API는 greenlet 없이 동작하지만, import 시점에 로드 시도함
+try:
+    import greenlet  # noqa
+except (ImportError, OSError):
+    import types
+    _fake = types.ModuleType("greenlet")
+    _fake.getcurrent = lambda: None
+    _fake.greenlet = type("greenlet", (), {"__init__": lambda s, *a, **k: None})
+    sys.modules["greenlet"] = _fake
+    sys.modules["greenlet._greenlet"] = _fake
+    _fg = types.ModuleType("_greenlet")
+    sys.modules["_greenlet"] = _fg
+
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
