@@ -8,8 +8,8 @@ import os
 import urllib.request
 from .base import BaseCrawler
 
-CRAWL_STATION_URL = os.environ.get("CRAWL_STATION_URL", "")
-CRAWL_STATION_KEY = os.environ.get("CRAWL_STATION_KEY", "")
+_SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+_SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 
 def _parse_num(s):
@@ -110,59 +110,88 @@ class InstagramProfileHandler(BaseCrawler):
             log_cb(f"     {len(results)}/{len(usernames)}개 수집")
         return results
 
+    def _sb_headers(self):
+        return {
+            "apikey": _SUPABASE_KEY,
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+            "Content-Type": "application/json",
+        }
+
     def _pick_account(self, worker_id: str, log_cb=None) -> dict | None:
-        """Station에서 사용 가능한 Instagram 계정 1개 발급"""
-        if not CRAWL_STATION_URL:
+        """Supabase에서 사용 가능한 Instagram 계정 1개 발급 (LRU)"""
+        if not _SUPABASE_URL:
             return None
         try:
-            import json as _json
-            data = _json.dumps({"worker_id": worker_id}).encode()
+            # 전용 워커 우선, 없으면 공용 계정
+            params = (
+                f"is_active=eq.true&status=eq.active"
+                f"&or=(assigned_worker_id.eq.{worker_id},assigned_worker_id.is.null)"
+                f"&order=last_used_at.asc.nullsfirst&limit=1"
+                f"&select=id,username,password,session_state"
+            )
             req = urllib.request.Request(
-                f"{CRAWL_STATION_URL}/api/instagram-accounts?action=pick",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+                f"{_SUPABASE_URL}/rest/v1/instagram_accounts?{params}",
+                headers={**self._sb_headers(), "Prefer": "return=representation"},
+                method="GET",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
-                body = _json.loads(resp.read())
-                acc = body.get("account")
-                if acc and log_cb:
-                    log_cb(f"  [Instagram] 계정 @{acc['username']} 사용")
-                return acc
+                rows = json.loads(resp.read())
+                if not rows:
+                    return None
+                acc = rows[0]
+            # last_used_at 갱신
+            now = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            patch_req = urllib.request.Request(
+                f"{_SUPABASE_URL}/rest/v1/instagram_accounts?id=eq.{acc['id']}",
+                data=json.dumps({"last_used_at": now}).encode(),
+                headers={**self._sb_headers(), "Prefer": "return=minimal"},
+                method="PATCH",
+            )
+            urllib.request.urlopen(patch_req, timeout=5)
+            if log_cb:
+                log_cb(f"  [Instagram] 계정 @{acc['username']} 사용")
+            return acc
         except Exception as e:
             if log_cb:
                 log_cb(f"  [Instagram] 계정 발급 실패 ({e}) — 익명으로 진행")
             return None
 
     def _report_block(self, account_id: str, log_cb=None):
-        """Station에 계정 차단 보고"""
-        if not CRAWL_STATION_URL or not account_id:
+        """Supabase에 계정 차단 보고 (120분 쿨다운)"""
+        if not _SUPABASE_URL or not account_id:
             return
         try:
-            import json as _json
-            data = _json.dumps({"account_id": account_id, "cooldown_minutes": 120}).encode()
+            from datetime import datetime, timedelta
+            blocked_until = (datetime.utcnow() + timedelta(minutes=120)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            body = json.dumps({
+                "status": "cooling",
+                "last_blocked_at": now,
+                "blocked_until": blocked_until,
+                "session_state": None,
+            }).encode()
             req = urllib.request.Request(
-                f"{CRAWL_STATION_URL}/api/instagram-accounts?action=block",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+                f"{_SUPABASE_URL}/rest/v1/instagram_accounts?id=eq.{account_id}",
+                data=body,
+                headers={**self._sb_headers(), "Prefer": "return=minimal"},
+                method="PATCH",
             )
             urllib.request.urlopen(req, timeout=5)
         except Exception:
             pass
 
     def _save_session(self, account_id: str, state: dict, log_cb=None):
-        """Station에 storageState 저장"""
-        if not CRAWL_STATION_URL or not account_id:
+        """Supabase에 storageState 저장"""
+        if not _SUPABASE_URL or not account_id:
             return
         try:
-            import json as _json
-            data = _json.dumps({"account_id": account_id, "session_state": state}).encode()
+            now = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            body = json.dumps({"session_state": state, "last_login_at": now}).encode()
             req = urllib.request.Request(
-                f"{CRAWL_STATION_URL}/api/instagram-accounts?action=session",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+                f"{_SUPABASE_URL}/rest/v1/instagram_accounts?id=eq.{account_id}",
+                data=body,
+                headers={**self._sb_headers(), "Prefer": "return=minimal"},
+                method="PATCH",
             )
             urllib.request.urlopen(req, timeout=10)
             if log_cb:

@@ -39,7 +39,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.15"
+VERSION = "0.9.16"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
