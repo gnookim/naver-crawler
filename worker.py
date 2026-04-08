@@ -17,6 +17,12 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo
+    _KST = ZoneInfo("Asia/Seoul")
+except ImportError:
+    # Python 3.8 이하 또는 zoneinfo 미설치 시 fallback
+    _KST = timezone(offset=__import__('datetime').timedelta(hours=9))
 
 # greenlet DLL 호환성 문제 우회 (Windows embedded Python)
 # playwright async API는 greenlet 없이 동작하지만, import 시점에 로드 시도함
@@ -33,7 +39,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.1"
+VERSION = "0.9.12"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -178,8 +184,8 @@ def load_config(sb):
         res = sb.table("worker_config").select("*").eq("id", "global").execute()
         if res.data:
             return res.data[0]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠️ Config 로드 실패: {e}")
 
     # 기본값
     return {
@@ -324,7 +330,8 @@ def check_update(sb):
 
 
 def apply_update(sb, release):
-    """최신 버전으로 업데이트 — 파일 다운로드 후 자동 재실행"""
+    """최신 버전으로 업데이트 — 파일 다운로드 후 핫 리로드"""
+    global VERSION, HANDLERS
     new_version = release["version"]
     files = release.get("files") or {}
     print(f"\n🔄 업데이트 v{VERSION} → v{new_version}")
@@ -365,13 +372,34 @@ def apply_update(sb, release):
         print("   ⚠️ 업데이트할 파일이 없습니다")
         return False
 
+    # 핸들러 핫 리로드 (재시작 없이 즉시 반영)
+    try:
+        import importlib
+        import handlers
+        import handlers.base
+        importlib.reload(handlers.base)
+        for mod_name in list(sys.modules.keys()):
+            if mod_name.startswith("handlers.") and mod_name != "handlers.base":
+                try:
+                    importlib.reload(sys.modules[mod_name])
+                except Exception:
+                    pass
+        importlib.reload(handlers)
+        # HANDLERS 딕셔너리 갱신
+        from handlers import HANDLERS as _new
+        HANDLERS.clear()
+        HANDLERS.update(_new)
+        print(f"   🔄 핸들러 핫 리로드 완료")
+    except Exception as e:
+        print(f"   ⚠️ 핫 리로드 실패 (다음 재시작 시 반영): {e}")
+
     # 버전 보고
+    VERSION = new_version
     sb.table("workers").update({
         "version": new_version,
     }).eq("id", WORKER_ID).execute()
 
-    print(f"   ✅ {updated}개 파일 업데이트 완료")
-    print(f"   다음 폴링 주기에 새 코드가 자동 반영됩니다.")
+    print(f"   ✅ {updated}개 파일 업데이트 완료 — 즉시 반영됨")
     return True
 
 
@@ -459,16 +487,118 @@ def handle_command(sb, command):
 
 
 # ── Heartbeat ─────────────────────────────────
+_heartbeat_status = {
+    "status": "idle",
+    "keyword": None,
+    "ctype": None,
+    "allowed_types": [],
+    # 차단 상태
+    "block_status": None,       # None | "cooling" | "blocked" | "banned"
+    "block_platform": None,     # None | "naver" | "instagram"
+    "block_level": None,        # None | 1 | 2 | 3
+    "blocked_until": None,      # ISO timestamp | None
+    "block_count_today": 0,
+}
+
+def _report_block(sb, platform: str, level: int, cooldown_minutes: int = 0, req_id: str = None):
+    """차단 감지 보고 + workers 테이블 업데이트
+    req_id를 전달하면 해당 작업을 pending으로 되돌려 다른 워커가 처리하도록 함
+    """
+    from datetime import timedelta
+    _heartbeat_status["block_platform"] = platform
+    _heartbeat_status["block_level"] = level
+    _heartbeat_status["block_count_today"] = _heartbeat_status.get("block_count_today", 0) + 1
+
+    if level == 1:
+        _heartbeat_status["block_status"] = "cooling"
+        until = (datetime.now(timezone.utc) + timedelta(minutes=cooldown_minutes or 30)).isoformat()
+        _heartbeat_status["blocked_until"] = until
+    elif level == 2:
+        _heartbeat_status["block_status"] = "blocked"
+        until = (datetime.now(timezone.utc) + timedelta(minutes=cooldown_minutes or 60)).isoformat()
+        _heartbeat_status["blocked_until"] = until
+    else:
+        _heartbeat_status["block_status"] = "banned"
+        _heartbeat_status["blocked_until"] = None
+
+    label = {1: "소프트", 2: "하드", 3: "영구"}.get(level, "")
+    print(f"\n  🚫 [{platform.upper()}] 차단 감지 Level {level} ({label}) — {_heartbeat_status['block_status']}")
+
+    try:
+        sb.table("workers").update({
+            "status": "blocked",
+            "block_status": _heartbeat_status["block_status"],
+            "block_platform": platform,
+            "block_level": level,
+            "blocked_until": _heartbeat_status["blocked_until"],
+            "block_count_today": _heartbeat_status["block_count_today"],
+        }).eq("id", WORKER_ID).execute()
+    except Exception as e:
+        print(f"  ⚠️ 차단 보고 실패: {e}")
+
+    # 진행 중이던 작업을 pending으로 되돌려 다른 워커가 이어받도록 함
+    if req_id:
+        try:
+            sb.table("crawl_requests").update({
+                "status": "pending",
+                "assigned_worker": None,
+                "started_at": None,
+            }).eq("id", req_id).execute()
+            print(f"  🔄 작업 {req_id[:8]} → pending (다른 워커에게 재배분)")
+        except Exception as e:
+            print(f"  ⚠️ 작업 재배분 실패: {e}")
+
+def _clear_block(sb):
+    """차단 해제"""
+    if not _heartbeat_status["block_status"]:
+        return
+    _heartbeat_status["block_status"] = None
+    _heartbeat_status["block_platform"] = None
+    _heartbeat_status["block_level"] = None
+    _heartbeat_status["blocked_until"] = None
+    try:
+        sb.table("workers").update({
+            "status": "idle",
+            "block_status": None,
+            "block_platform": None,
+            "block_level": None,
+            "blocked_until": None,
+        }).eq("id", WORKER_ID).execute()
+    except Exception:
+        pass
+
 def heartbeat(sb, status="idle", keyword=None, ctype=None):
+    """즉시 heartbeat 전송 + 상태 저장 (백그라운드 태스크가 참조)"""
+    _heartbeat_status["status"] = status
+    _heartbeat_status["keyword"] = keyword
+    _heartbeat_status["ctype"] = ctype
     try:
         sb.table("workers").update({
             "last_seen": datetime.now(timezone.utc).isoformat(),
             "status": status,
             "current_keyword": keyword,
             "current_type": ctype,
+            "allowed_types": _heartbeat_status["allowed_types"] or None,
         }).eq("id", WORKER_ID).execute()
     except Exception:
         pass
+
+async def _heartbeat_loop(sb, interval=10):
+    """백그라운드 heartbeat — 메인 루프와 독립적으로 10초마다 전송"""
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            sb.table("workers").update({
+                "last_seen": datetime.now(timezone.utc).isoformat(),
+                "status": _heartbeat_status["block_status"] and "blocked" or _heartbeat_status["status"],
+                "current_keyword": _heartbeat_status["keyword"],
+                "current_type": _heartbeat_status["ctype"],
+                "allowed_types": _heartbeat_status["allowed_types"] or None,
+            }).eq("id", WORKER_ID).execute()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"  ⚠️ heartbeat 실패: {e}")
 
 
 # ── 작업 처리 ──────────────────────────────────
@@ -535,7 +665,8 @@ async def process_request(sb, req, config, log_cb=None):
         _meta["result_count"] = len(results) if results else 0
         _meta["empty_result"] = _meta["result_count"] == 0
 
-        # 차단/캡챠 감지 (결과에서)
+        # 차단/캡챠 감지
+        platform = "instagram" if req_type == "instagram_profile" else "naver"
         if results:
             for item in results:
                 item_str = str(item).lower()
@@ -544,6 +675,23 @@ async def process_request(sb, req, config, log_cb=None):
                     _meta["blocked"] = True
                 if "차단" in item_str or "blocked" in item_str:
                     _meta["blocked"] = True
+                if "login" in item_str or "로그인" in item_str:
+                    _meta["blocked"] = True
+
+        # 빈 결과 + 이전 차단 이력 → Level 1 (작업은 완료 처리, 재배분 안 함)
+        if _meta["empty_result"] and _heartbeat_status["block_count_today"] > 2:
+            _report_block(sb, platform, level=1, cooldown_minutes=30)
+        elif _meta["captcha"]:
+            # 캡챠 = 하드 차단 → 작업 재배분
+            _report_block(sb, platform, level=2, cooldown_minutes=60, req_id=req_id)
+            return  # crawl_requests 업데이트는 _report_block에서 처리
+        elif _meta["blocked"]:
+            # 차단 감지 → 작업 재배분
+            _report_block(sb, platform, level=2, cooldown_minutes=60, req_id=req_id)
+            return
+        elif _heartbeat_status["block_status"] and not _meta["empty_result"]:
+            # 성공적으로 결과 받으면 차단 해제
+            _clear_block(sb)
 
         if results:
             rows = [{
@@ -576,11 +724,23 @@ async def process_request(sb, req, config, log_cb=None):
         _meta["response_time_ms"] = int((time.time() - _t0) * 1000)
         _meta["error_type"] = type(e).__name__
         err_str = str(e).lower()
+        platform = "instagram" if req_type == "instagram_profile" else "naver"
         if "captcha" in err_str or "보안문자" in err_str:
             _meta["captcha"] = True
             _meta["blocked"] = True
-        if "timeout" in err_str or "navigation" in err_str:
+            # 차단으로 인한 실패 → 작업 재배분 (다른 워커가 처리)
+            _report_block(sb, platform, level=2, cooldown_minutes=60, req_id=req_id)
+            if log_cb: log_cb(f"  🚫 캡챠 차단 — 작업 재배분 완료")
+            return
+        elif "login" in err_str or "로그인" in err_str:
             _meta["blocked"] = True
+            _report_block(sb, platform, level=2, cooldown_minutes=60, req_id=req_id)
+            if log_cb: log_cb(f"  🚫 로그인 요구 차단 — 작업 재배분 완료")
+            return
+        elif "timeout" in err_str or "navigation" in err_str:
+            _meta["blocked"] = True
+            _report_block(sb, platform, level=1, cooldown_minutes=15)
+            # timeout은 재배분하지 않고 실패 처리 (네트워크 문제일 수 있음)
 
         if log_cb: log_cb(f"  ❌ 오류: {e}")
         sb.table("crawl_requests").update({
@@ -714,24 +874,45 @@ async def main():
     else:
         print(f"  🌐 네트워크: {network_type}")
 
+    # allowed_types 설정 — 빈 리스트면 모든 타입 처리
+    allowed_types = config.get("allowed_types") or []
+    if isinstance(allowed_types, str):
+        import json as _json
+        try:
+            allowed_types = _json.loads(allowed_types)
+        except Exception:
+            allowed_types = []
+    _heartbeat_status["allowed_types"] = allowed_types
+    if allowed_types:
+        print(f"  🔒 허용 타입: {', '.join(allowed_types)}")
+    else:
+        print(f"  🌐 허용 타입: 전체 (제한 없음)")
+
     heartbeat(sb, "idle")
 
-    # 내게 할당된 미처리 요청 처리
-    res = sb.table("crawl_requests").select("*") \
+    # 백그라운드 heartbeat 시작 (10초마다 — 메인 루프 sleep 중에도 상태 유지)
+    hb_task = asyncio.create_task(_heartbeat_loop(sb, interval=10))
+
+    # 내게 할당된 미처리 요청 처리 (타입 필터 적용)
+    q = sb.table("crawl_requests").select("*") \
         .eq("assigned_worker", WORKER_ID) \
         .eq("status", "assigned") \
         .order("priority", desc=True) \
-        .order("created_at") \
-        .execute()
+        .order("created_at")
+    if allowed_types:
+        q = q.in_("type", allowed_types)
+    res = q.execute()
     assigned = res.data or []
 
-    # 할당 안 된 pending 요청도 가져오기 (하위 호환)
-    res2 = sb.table("crawl_requests").select("*") \
+    # 할당 안 된 pending 요청도 가져오기 (하위 호환, 타입 필터 적용)
+    q2 = sb.table("crawl_requests").select("*") \
         .is_("assigned_worker", "null") \
         .eq("status", "pending") \
         .order("priority", desc=True) \
-        .order("created_at") \
-        .execute()
+        .order("created_at")
+    if allowed_types:
+        q2 = q2.in_("type", allowed_types)
+    res2 = q2.execute()
     pending = res2.data or []
 
     backlog = assigned + pending
@@ -773,10 +954,8 @@ async def main():
 
     batch_count = 0
     loop_count = 0
-    _pending_restart = False
     while True:
         try:
-            heartbeat(sb, "idle")
             loop_count += 1
 
             # 주기적으로 원격 명령 + 업데이트 체크 (매 ~30초)
@@ -790,16 +969,14 @@ async def main():
                 update = check_update(sb)
                 if update:
                     print(f"\n  📦 새 버전 v{update['version']} 발견 — 자동 업데이트")
-                    if apply_update(sb, update):
-                        # 배치 휴식 시점에 재시작 (메인 루프 중단 없이)
-                        _pending_restart = True
+                    apply_update(sb, update)
 
                 # config 주기적 재로드 (quota 등 반영)
                 config = load_config(sb)
 
             # ── 새벽 휴식 (KST 3~5시) ──
-            kst_now = datetime.now(timezone.utc).astimezone()
-            kst_hour = (kst_now.hour + 9) % 24  # UTC → KST 간이 변환
+            kst_now = datetime.now(_KST)
+            kst_hour = kst_now.hour
             rest_hours = config.get("rest_hours", [3, 4, 5])
             if kst_hour in rest_hours:
                 if loop_count % 60 == 1:  # 5분마다 로그
@@ -817,9 +994,7 @@ async def main():
                 try:
                     from datetime import date as _date
                     reset_date = _date.fromisoformat(quota_reset_at[:10])
-                    # KST = UTC+9
-                    kst_now = datetime.now(timezone.utc).astimezone()
-                    kst_today = kst_now.date()
+                    kst_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
                     if reset_date < kst_today:
                         sb.rpc("reset_daily_quota_if_needed", {"wid": WORKER_ID}).execute()
                         daily_used = 0
@@ -833,25 +1008,70 @@ async def main():
                 await asyncio.sleep(60)
                 continue
 
-            # 1) 내게 할당된 작업
-            res = sb.table("crawl_requests").select("*") \
-                .eq("assigned_worker", WORKER_ID) \
-                .eq("status", "assigned") \
-                .order("priority", desc=True) \
-                .order("created_at") \
-                .limit(1).execute()
+            # allowed_types 변경 반영 (config 리로드 시)
+            allowed_types = config.get("allowed_types") or []
+            if isinstance(allowed_types, str):
+                import json as _json
+                try:
+                    allowed_types = _json.loads(allowed_types)
+                except Exception:
+                    allowed_types = []
+            _heartbeat_status["allowed_types"] = allowed_types
+
+            # ── 차단 쿨다운 체크 ──
+            blocked_until = _heartbeat_status.get("blocked_until")
+            if blocked_until:
+                try:
+                    bu = datetime.fromisoformat(blocked_until.replace("Z", "+00:00"))
+                    remaining = (bu - datetime.now(timezone.utc)).total_seconds()
+                    if remaining > 0:
+                        if loop_count % 12 == 1:  # 1분마다 로그
+                            mins = int(remaining // 60)
+                            print(f"  🚫 차단 쿨다운 중 — {mins}분 {int(remaining % 60)}초 남음")
+                        await asyncio.sleep(min(30, remaining))
+                        continue
+                    else:
+                        # 쿨다운 만료 → 차단 해제
+                        _clear_block(sb)
+                        print(f"  ✅ 차단 쿨다운 만료 — 작업 재개")
+                except Exception:
+                    pass
+
+            # 1) 내게 할당된 작업 (타입 필터 적용)
+            try:
+                q = sb.table("crawl_requests").select("*") \
+                    .eq("assigned_worker", WORKER_ID) \
+                    .eq("status", "assigned") \
+                    .order("priority", desc=True) \
+                    .order("created_at") \
+                    .limit(1)
+                if allowed_types:
+                    q = q.in_("type", allowed_types)
+                res = q.execute()
+            except Exception as qe:
+                print(f"  ⚠️ 작업 조회 실패: {qe}")
+                await asyncio.sleep(10)
+                continue
 
             task = None
             if res.data:
                 task = res.data[0]
             else:
-                # 2) 미할당 pending 작업 (하위 호환)
-                res2 = sb.table("crawl_requests").select("*") \
-                    .is_("assigned_worker", "null") \
-                    .eq("status", "pending") \
-                    .order("priority", desc=True) \
-                    .order("created_at") \
-                    .limit(1).execute()
+                # 2) 미할당 pending 작업 (하위 호환, 타입 필터 적용)
+                try:
+                    q2 = sb.table("crawl_requests").select("*") \
+                        .is_("assigned_worker", "null") \
+                        .eq("status", "pending") \
+                        .order("priority", desc=True) \
+                        .order("created_at") \
+                        .limit(1)
+                    if allowed_types:
+                        q2 = q2.in_("type", allowed_types)
+                    res2 = q2.execute()
+                except Exception as qe:
+                    print(f"  ⚠️ pending 작업 조회 실패: {qe}")
+                    await asyncio.sleep(10)
+                    continue
                 if res2.data:
                     task = res2.data[0]
                     sb.table("crawl_requests").update({
@@ -867,15 +1087,10 @@ async def main():
                 try:
                     sb.rpc("increment_daily_used", {"wid": WORKER_ID}).execute()
                     config["daily_used"] = config.get("daily_used", 0) + 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"  ⚠️ 할당량 증가 실패: {e}")
 
                 if batch_count >= config.get("batch_size", 30):
-                    # 업데이트 대기 중이면 배치 휴식 시점에 재시작
-                    if _pending_restart:
-                        print("\n  🔄 업데이트 적용을 위해 재시작합니다...")
-                        restart_worker()  # 새 프로세스 시작 + 자기 종료
-
                     rest = config.get("batch_rest_seconds", 180)
                     print(f"\n  😴 배치 완료 — {rest}초 휴식")
                     await asyncio.sleep(rest)
@@ -912,6 +1127,11 @@ async def main():
             print(f"⚠️ {e}")
             await asyncio.sleep(10)
 
+    hb_task.cancel()
+    try:
+        await hb_task
+    except asyncio.CancelledError:
+        pass
     heartbeat(sb, "offline")
     print("\n👋 종료")
 
