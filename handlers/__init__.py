@@ -5,6 +5,7 @@ from .serp import BlogSerpHandler
 from .area import AreaAnalysisHandler
 from .deep import DeepAnalysisHandler
 from .rank import DailyRankHandler
+from .instagram import InstagramProfileHandler
 
 HANDLERS = {
     "kin_analysis": KinHandler,
@@ -14,4 +15,5 @@ HANDLERS = {
     "deep_analysis": DeepAnalysisHandler,
     "daily_rank": DailyRankHandler,
     "rank_check": DailyRankHandler,  # 기존 타입 호환
+    "instagram_profile": InstagramProfileHandler,
 }

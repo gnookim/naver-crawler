@@ -21,17 +21,28 @@ class BlogSerpHandler(BaseCrawler):
                 const results = [];
                 const seen = new Set();
                 const allLinks = document.querySelectorAll('a[href*="blog.naver.com"]');
+                // 1차: URL별로 가장 긴 텍스트를 가진 링크 수집
+                const urlMap = new Map();
                 allLinks.forEach(a => {
                     const href = a.href;
                     if (!href.match(/blog\\.naver\\.com\\/[^/]+\\/\\d+/)) return;
-                    if (seen.has(href)) return;
-                    const text = a.innerText.trim();
-                    if (text.length < 5 || text.length > 200) return;
-                    if (text.includes('블로그') && text.length < 10) return;
-                    seen.add(href);
-                    results.push({ title: text.slice(0, 150), url: href });
+                    // URL 정규화 (쿼리 파라미터 제거)
+                    const cleanUrl = href.split('?')[0];
+                    const text = (a.innerText || '').trim();
+                    const existing = urlMap.get(cleanUrl);
+                    if (!existing || text.length > (existing.title || '').length) {
+                        urlMap.set(cleanUrl, { title: text, url: cleanUrl });
+                    }
                 });
-                return results.slice(0, maxItems);
+                // 2차: 제목이 있는 것만 결과로
+                for (const [url, item] of urlMap) {
+                    if (item.title.length < 3) continue;
+                    if (item.title.length > 200) item.title = item.title.slice(0, 150);
+                    if (item.title === '블로그') continue;
+                    results.push({ title: item.title.slice(0, 150), url: item.url });
+                    if (results.length >= maxItems) break;
+                }
+                return results;
             }""", max_items)
 
             if log_cb: log_cb(f"     {len(results)}개 수집")

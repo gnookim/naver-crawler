@@ -2,6 +2,7 @@
 기본 크롤러 — 사람 흉내 + 봇 탐지 우회 + 프록시 지원
 모든 핸들러가 이 클래스를 상속받는다.
 """
+import os
 import random
 import time
 
@@ -203,17 +204,38 @@ class BaseCrawler:
                 pass
 
     # 무작위 decoy 검색 키워드 (다양한 관심사)
-    DECOY_QUERIES = [
-        "오늘 날씨", "맛집 추천", "영화 순위", "주식 시세", "아이폰 케이스",
-        "여행 추천", "다이어트 방법", "운동 루틴", "카페 추천", "신차 가격",
-        "반려견 사료", "헤어스타일 남자", "맥북 할인", "전세 매물", "이직 준비",
-        "치킨 배달", "넷플릭스 추천", "헬스장 가격", "한강 공원", "가성비 이어폰",
-        "생일 선물", "주말 나들이", "인테리어 비용", "자취 꿀팁", "연말정산",
-    ]
+    # 워커별 관심사 프로필 — 같은 워커는 일관된 관심사로 검색
+    DECOY_PROFILES = {
+        "생활": ["오늘 날씨", "맛집 추천", "카페 추천", "치킨 배달", "주말 나들이",
+                 "한강 공원", "자취 꿀팁", "인테리어 비용", "생일 선물", "세탁기 추천"],
+        "IT": ["맥북 할인", "아이폰 케이스", "가성비 이어폰", "코딩 배우기", "AI 뉴스",
+               "모니터 추천", "기계식 키보드", "클라우드 서비스", "앱 개발", "데이터 분석"],
+        "건강": ["다이어트 방법", "운동 루틴", "헬스장 가격", "단백질 보충제", "요가 효과",
+                 "러닝화 추천", "건강검진 비용", "수면 팁", "스트레칭", "비타민 추천"],
+        "재테크": ["주식 시세", "전세 매물", "연말정산", "적금 금리", "부동산 전망",
+                  "ETF 추천", "신용카드 혜택", "중고차 시세", "보험 비교", "재테크 초보"],
+        "취미": ["영화 순위", "넷플릭스 추천", "여행 추천", "캠핑 장비", "독서 추천",
+                "게임 추천", "콘서트 일정", "등산 코스", "낚시 포인트", "사진 촬영 팁"],
+    }
+    # fallback — 프로필 미지정 시
+    DECOY_QUERIES = [q for qs in DECOY_PROFILES.values() for q in qs]
+
+    def _get_decoy_queries(self):
+        """워커 config의 decoy_profile에 따라 키워드 세트 반환"""
+        profile = self.config.get("decoy_profile", "")
+        if profile and profile in self.DECOY_PROFILES:
+            return self.DECOY_PROFILES[profile]
+        # 프로필 미지정 시 워커 ID 기반으로 자동 배정
+        worker_id = os.environ.get("WORKER_ID", "")
+        if worker_id:
+            profiles = list(self.DECOY_PROFILES.keys())
+            idx = hash(worker_id) % len(profiles)
+            return self.DECOY_PROFILES[profiles[idx]]
+        return self.DECOY_QUERIES
 
     async def decoy_search(self, page):
-        """목적 없는 검색 — 분석 대상이 아닌 일반 검색으로 패턴 위장"""
-        query = random.choice(self.DECOY_QUERIES)
+        """목적 없는 검색 — 워커별 관심사 프로필로 패턴 위장"""
+        query = random.choice(self._get_decoy_queries())
         try:
             await page.goto("https://www.naver.com", wait_until="domcontentloaded", timeout=15000)
             await page.wait_for_timeout(random.randint(500, 1500))
