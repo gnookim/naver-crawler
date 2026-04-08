@@ -39,7 +39,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.12"
+VERSION = "0.9.13"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 환경변수 ─────────────────────────────────
@@ -58,6 +58,8 @@ load_env()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 WORKER_ID = os.environ.get("WORKER_ID", "")
+CRAWL_STATION_URL = os.environ.get("CRAWL_STATION_URL", "")
+CRAWL_STATION_KEY = os.environ.get("CRAWL_STATION_KEY", "")
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 from handlers import HANDLERS
@@ -659,6 +661,10 @@ async def process_request(sb, req, config, log_cb=None):
 
     try:
         handler = handler_cls(headless=True, config=config)
+        # instagram_profile 핸들러에 worker_id 주입 (계정 발급용)
+        if req_type == "instagram_profile":
+            options = dict(options)
+            options.setdefault("worker_id", WORKER_ID)
         results = await handler.handle(keyword, options, log_cb=log_cb)
 
         _meta["response_time_ms"] = int((time.time() - _t0) * 1000)
