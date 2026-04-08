@@ -69,20 +69,28 @@ class InstagramProfileHandler(BaseCrawler):
                     self._report_block(account["id"], log_cb)
                     account = None
 
+            login_gate_hit = False  # 로그인 게이트 감지 플래그
+
             for i, username in enumerate(usernames):
                 if log_cb:
                     log_cb(f"  [{i+1}/{len(usernames)}] @{username}")
 
                 profile = await self._fetch_profile(ctx, username, fetch_reels, log_cb)
 
-                # 로그인 페이지로 리다이렉트 됐다면 차단
-                if profile is None and account:
-                    if log_cb:
-                        log_cb(f"     ⚠️ 계정 차단 감지 — Station에 보고")
-                    self._report_block(account["id"], log_cb)
-                    account = None  # 이후는 익명으로 진행
-
-                if profile:
+                if profile is None:
+                    if account:
+                        # 계정 사용 중 None → 차단 보고
+                        if log_cb:
+                            log_cb(f"     ⚠️ 계정 차단 감지 — Station에 보고")
+                        self._report_block(account["id"], log_cb)
+                        account = None
+                    else:
+                        # 익명 상태에서 None → 로그인 게이트 (모든 계정에서 동일하게 실패)
+                        login_gate_hit = True
+                        if log_cb:
+                            log_cb(f"     ℹ️ 로그인 게이트 — Station에 Instagram 계정 등록 필요")
+                        break  # 나머지 계정도 동일하게 실패하므로 중단
+                else:
                     results.append(profile)
 
                 if i < len(usernames) - 1:
@@ -264,6 +272,27 @@ class InstagramProfileHandler(BaseCrawler):
                 timeout=20000,
             )
             await page.wait_for_timeout(random.randint(2000, 4000))
+
+            # 로그인 게이트 감지 — 로그인 페이지로 리다이렉트됐으면 None 반환
+            current_url = page.url
+            if "accounts/login" in current_url:
+                if log_cb:
+                    log_cb(f"     ⛔ 로그인 필요 — 계정 없이 접근 불가")
+                return None
+
+            # 로그인 요구 팝업/게이트 감지 (URL은 정상이나 로그인 UI 표시)
+            login_gate = await page.evaluate("""() => {
+                var forms = document.querySelectorAll('form[method="post"]');
+                for (var i = 0; i < forms.length; i++) {
+                    var inputs = forms[i].querySelectorAll('input[name="username"], input[name="password"]');
+                    if (inputs.length >= 2) return true;
+                }
+                return false;
+            }""")
+            if login_gate:
+                if log_cb:
+                    log_cb(f"     ⛔ 로그인 게이트 감지")
+                return None
 
             # 메타태그 + DOM 숫자 동시 수집
             meta = await page.evaluate("""() => {
