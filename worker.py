@@ -39,8 +39,11 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.16"
+VERSION = "0.9.25"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Python 워커가 처리하지 않는 타입 (향후 확장용 — 현재는 모든 타입 처리 가능)
+PYTHON_EXCLUDED_TYPES: list = []
 
 # ── 환경변수 ─────────────────────────────────
 def load_env():
@@ -380,12 +383,24 @@ def apply_update(sb, release):
         import handlers
         import handlers.base
         importlib.reload(handlers.base)
+        # 기존 모듈 리로드
         for mod_name in list(sys.modules.keys()):
             if mod_name.startswith("handlers.") and mod_name != "handlers.base":
                 try:
                     importlib.reload(sys.modules[mod_name])
                 except Exception:
                     pass
+        # 새로 추가된 핸들러 파일 import (sys.modules에 없는 것)
+        import os as _os
+        handler_dir = _os.path.join(WORKER_DIR, "handlers")
+        for _f in _os.listdir(handler_dir):
+            if _f.endswith(".py") and not _f.startswith("_"):
+                mod = f"handlers.{_f[:-3]}"
+                if mod not in sys.modules:
+                    try:
+                        importlib.import_module(mod)
+                    except Exception:
+                        pass
         importlib.reload(handlers)
         # HANDLERS 딕셔너리 갱신
         from handlers import HANDLERS as _new
@@ -397,9 +412,12 @@ def apply_update(sb, release):
 
     # 버전 보고
     VERSION = new_version
-    sb.table("workers").update({
-        "version": new_version,
-    }).eq("id", WORKER_ID).execute()
+    try:
+        sb.table("workers").update({
+            "version": new_version,
+        }).eq("id", WORKER_ID).execute()
+    except Exception as e:
+        print(f"   ⚠️ 버전 보고 실패: {e}")
 
     print(f"   ✅ {updated}개 파일 업데이트 완료 — 즉시 반영됨")
     return True
@@ -578,6 +596,7 @@ def heartbeat(sb, status="idle", keyword=None, ctype=None):
         sb.table("workers").update({
             "last_seen": datetime.now(timezone.utc).isoformat(),
             "status": status,
+            "version": VERSION,
             "current_keyword": keyword,
             "current_type": ctype,
             "allowed_types": _heartbeat_status["allowed_types"] or None,
@@ -892,7 +911,7 @@ async def main():
     if allowed_types:
         print(f"  🔒 허용 타입: {', '.join(allowed_types)}")
     else:
-        print(f"  🌐 허용 타입: 전체 (제한 없음)")
+        print(f"  🌐 허용 타입: 전체 (oclick_sync 제외)")
 
     heartbeat(sb, "idle")
 
@@ -907,6 +926,8 @@ async def main():
         .order("created_at")
     if allowed_types:
         q = q.in_("type", allowed_types)
+    else:
+        q = q.not_.in_("type", PYTHON_EXCLUDED_TYPES)
     res = q.execute()
     assigned = res.data or []
 
@@ -918,6 +939,8 @@ async def main():
         .order("created_at")
     if allowed_types:
         q2 = q2.in_("type", allowed_types)
+    else:
+        q2 = q2.not_.in_("type", PYTHON_EXCLUDED_TYPES)
     res2 = q2.execute()
     pending = res2.data or []
 
@@ -1053,6 +1076,8 @@ async def main():
                     .limit(1)
                 if allowed_types:
                     q = q.in_("type", allowed_types)
+                else:
+                    q = q.not_.in_("type", PYTHON_EXCLUDED_TYPES)
                 res = q.execute()
             except Exception as qe:
                 print(f"  ⚠️ 작업 조회 실패: {qe}")
@@ -1073,6 +1098,8 @@ async def main():
                         .limit(1)
                     if allowed_types:
                         q2 = q2.in_("type", allowed_types)
+                    else:
+                        q2 = q2.not_.in_("type", PYTHON_EXCLUDED_TYPES)
                     res2 = q2.execute()
                 except Exception as qe:
                     print(f"  ⚠️ pending 작업 조회 실패: {qe}")

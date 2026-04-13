@@ -6,6 +6,8 @@ from .area import AreaAnalysisHandler
 from .deep import DeepAnalysisHandler
 from .rank import DailyRankHandler
 from .instagram import InstagramProfileHandler
+from .instagram_post import InstagramPostHandler
+from .oclick import OclickSyncHandler
 
 HANDLERS = {
     "kin_analysis": KinHandler,
@@ -16,4 +18,6 @@ HANDLERS = {
     "daily_rank": DailyRankHandler,
     "rank_check": DailyRankHandler,  # 기존 타입 호환
     "instagram_profile": InstagramProfileHandler,
+    "instagram_post": InstagramPostHandler,  # 게시물 성과 수집
+    "oclick_sync": OclickSyncHandler,
 }
