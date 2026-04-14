@@ -1,6 +1,7 @@
 name: Auto Release to CrawlStation
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
