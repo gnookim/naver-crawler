@@ -1,0 +1,120 @@
+name: Auto Release to CrawlStation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker.py"
+      - "handlers/**"
+      - "supabase_rest.py"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract VERSION from worker.py
+        id: version
+        run: |
+          VERSION=$(grep -E '^VERSION\s*=\s*"' worker.py | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Read worker files
+        id: files
+        run: |
+          python3 - << 'PYEOF'
+          import json, os
+
+          FILES = [
+            "worker.py",
+            "handlers/__init__.py",
+            "handlers/base.py",
+            "handlers/blog.py",
+            "handlers/serp.py",
+            "handlers/kin.py",
+            "handlers/area.py",
+            "handlers/deep.py",
+            "handlers/rank.py",
+            "handlers/instagram.py",
+            "handlers/instagram_post.py",
+            "handlers/oclick.py",
+            "supabase_rest.py",
+          ]
+
+          files = {}
+          for f in FILES:
+            if os.path.exists(f):
+              with open(f, "r", encoding="utf-8") as fh:
+                files[f] = fh.read()
+              print(f"  OK: {f} ({len(files[f])} chars)")
+            else:
+              print(f"  SKIP: {f} (not found)")
+
+          with open("/tmp/worker_files.json", "w") as out:
+            json.dump(files, out)
+          print(f"\nTotal: {len(files)} files")
+          PYEOF
+
+      - name: Publish release to CrawlStation
+        env:
+          STATION_URL: ${{ secrets.STATION_URL }}
+          RELEASE_API_KEY: ${{ secrets.RELEASE_API_KEY }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - << 'PYEOF'
+          import json, urllib.request, os
+
+          station_url = os.environ["STATION_URL"].rstrip("/")
+          api_key = os.environ["RELEASE_API_KEY"]
+          version = os.environ["VERSION"]
+
+          with open("/tmp/worker_files.json") as f:
+            files = json.load(f)
+
+          payload = json.dumps({
+            "version": version,
+            "changelog": f"v{version} 자동 릴리즈",
+            "files": files,
+          }).encode()
+
+          req = urllib.request.Request(
+            f"{station_url}/api/releases",
+            data=payload,
+            headers={
+              "Content-Type": "application/json",
+              "x-api-key": api_key,
+            },
+            method="POST",
+          )
+
+          try:
+            with urllib.request.urlopen(req) as res:
+              body = res.read().decode()
+              print(f"SUCCESS ({res.status}): {body}")
+          except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            print(f"ERROR ({e.code}): {body}")
+            exit(1)
+          PYEOF
+
+      - name: Trigger Mac PKG build
+        env:
+          GH_TOKEN: ${{ secrets.CRAWL_STATION_PAT }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh workflow run build-mac-pkg.yml \
+            -R gnookim/crawl-station \
+            -f version=$VERSION
+          echo "Mac PKG build triggered: v$VERSION"
+
+      - name: Trigger Windows installer build
+        env:
+          GH_TOKEN: ${{ secrets.CRAWL_STATION_PAT }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh workflow run build-win-installer.yml \
+            -R gnookim/crawl-station \
+            -f version=$VERSION
+          echo "Windows installer build triggered: v$VERSION"
