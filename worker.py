@@ -39,7 +39,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.25"
+VERSION = "0.9.30"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Python 워커가 처리하지 않는 타입 (향후 확장용 — 현재는 모든 타입 처리 가능)
