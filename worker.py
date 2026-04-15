@@ -39,7 +39,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.33"
+VERSION = "0.9.41"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Python 워커가 처리하지 않는 타입 (향후 확장용 — 현재는 모든 타입 처리 가능)
@@ -61,6 +61,7 @@ load_env()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 WORKER_ID = os.environ.get("WORKER_ID", "")
+WORKER_NAME = os.environ.get("WORKER_NAME", "")  # 설치 시 지정한 식별 이름 (미입력 시 hostname 사용)
 CRAWL_STATION_URL = os.environ.get("CRAWL_STATION_URL", "")
 CRAWL_STATION_KEY = os.environ.get("CRAWL_STATION_KEY", "")
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -99,8 +100,76 @@ def sso_log(action: str, metadata: dict = {}):
 # 최근 처리한 작업 ID (무한루프 방지)
 _processed_ids: set = set()
 
-# 업데이트 체크 간격 (heartbeat 횟수 기준)
-_UPDATE_CHECK_INTERVAL = 6  # 5초 × 6 = 30초마다 업데이트/명령 체크
+# 명령/config 체크 간격 (heartbeat 횟수 기준)
+_UPDATE_CHECK_INTERVAL = 6  # 5초 × 6 = 30초마다 명령·config 체크
+
+# 업데이트 체크 타임스탬프 (시간 기반)
+_last_update_check_time: float = 0.0  # 0 = 즉시 체크
+
+
+# ── Watchdog 자동 등록 (Windows 전용) ────────────────────────────────
+def ensure_watchdog():
+    """
+    Windows 작업 스케줄러에 watchdog 등록 여부를 확인하고, 없으면 자동 등록.
+    워커 시작 시 호출 → 이후 워커가 꺼져도 5분 내 자동 복구.
+    Windows가 아닌 환경에서는 무시.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        # 이미 등록되어 있는지 확인
+        check = subprocess.run(
+            ["schtasks", "/query", "/tn", "CrawlStationWatchdog"],
+            capture_output=True, text=True, timeout=10
+        )
+        if check.returncode == 0:
+            return  # 이미 등록됨
+
+        # watchdog.py 경로 확인 — 없으면 Station에서 다운로드
+        watchdog_path = os.path.join(WORKER_DIR, "watchdog.py")
+        if not os.path.exists(watchdog_path):
+            station_url = os.environ.get("CRAWL_STATION_URL", "https://crawl-station.vercel.app")
+            try:
+                import urllib.request
+                urllib.request.urlretrieve(
+                    f"{station_url}/api/download?file=watchdog.py",
+                    watchdog_path
+                )
+            except Exception:
+                return  # 다운로드 실패 시 무시
+
+        # pythonw.exe 경로 결정
+        pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+        if not os.path.exists(pythonw):
+            pythonw = sys.executable
+
+        # 작업 스케줄러에 5분마다 실행 등록
+        subprocess.run(
+            [
+                "schtasks", "/create",
+                "/tn", "CrawlStationWatchdog",
+                "/tr", f'"{pythonw}" "{watchdog_path}"',
+                "/sc", "minute", "/mo", "5",
+                "/ru", os.environ.get("USERNAME", ""),
+                "/f",
+            ],
+            capture_output=True, text=True, timeout=15
+        )
+    except Exception:
+        pass  # 실패해도 워커 동작에 영향 없음
+
+
+def log_error(sb, message: str, level: str = "error", context: dict = None):
+    """에러/경고를 Supabase worker_logs 테이블에 기록 (실패해도 무시)"""
+    try:
+        sb.table("worker_logs").insert({
+            "worker_id": WORKER_ID,
+            "level": level,
+            "message": str(message)[:1000],
+            "context": context or {},
+        }).execute()
+    except Exception:
+        pass
 
 
 # ── 워커 ID 관리 ────────────────────────────────
@@ -152,14 +221,18 @@ def collect_machine_info():
 
 # ── CrawlStation 자동등록 ──────────────────────
 def register_worker(sb):
-    """워커를 CrawlStation에 자동 등록 (UPSERT)"""
+    """워커를 CrawlStation에 자동 등록 (UPSERT). 신규 등록 여부 반환."""
     info = collect_machine_info()
     now = datetime.now(timezone.utc).isoformat()
 
     try:
+        # 기존 verified_at 확인 (신규인지 판단)
+        existing = sb.table("workers").select("verified_at").eq("id", WORKER_ID).execute()
+        already_verified = bool(existing.data and existing.data[0].get("verified_at"))
+
         sb.table("workers").upsert({
             "id": WORKER_ID,
-            "name": info["hostname"],
+            "name": WORKER_NAME or info["hostname"],
             "os": info["os"],
             "hostname": info["hostname"],
             "python_version": info["python_version"],
@@ -170,10 +243,59 @@ def register_worker(sb):
             "registered_by": "auto",
             "command": None,
         }, on_conflict="id").execute()
-        return True
+        return True, already_verified
     except Exception as e:
         print(f"  ⚠️ 워커 등록 실패: {e}")
-        return False
+        return False, False
+
+
+async def _auto_verify_task(station_url: str, worker_id: str):
+    """등록 직후 자동 검증 — 네이버·오클릭 테스트 후 verified_at 업데이트"""
+    import json as _json
+    import urllib.request as _urllib_req
+    import ssl as _ssl
+
+    def _post(url: str, payload: dict, timeout: int = 130) -> dict:
+        data = _json.dumps(payload).encode()
+        req = _urllib_req.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            ctx = _ssl._create_unverified_context()
+            with _urllib_req.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return _json.loads(resp.read())
+        except Exception:
+            with _urllib_req.urlopen(req, timeout=timeout) as resp:
+                return _json.loads(resp.read())
+
+    await asyncio.sleep(8)  # 메인 루프 시작 대기
+    print("  🔍 자동 검증 시작 (N + O)...")
+
+    # 1) 네이버 테스트
+    naver_ok = False
+    try:
+        result = _post(f"{station_url}/api/test/worker", {"worker_id": worker_id, "category": "naver"})
+        naver_ok = result.get("ok", False)
+        print(f"  {'✅' if naver_ok else '⚠️'} 네이버: {'통과' if naver_ok else result.get('error', '실패')}")
+    except Exception as e:
+        print(f"  ⚠️ 네이버 검증 오류: {e}")
+
+    # 2) 오클릭 테스트 (credentials이 station_settings에 없으면 건너뜀)
+    oclick_ok = False
+    try:
+        result = _post(f"{station_url}/api/test/oclick", {"worker_id": worker_id}, timeout=200)
+        if "company_code" in result.get("error", ""):
+            print("  ⏭️ 오클릭: credentials 미설정 — 건너뜀")
+            oclick_ok = True  # credentials 없으면 검증 대상 아님으로 간주
+        else:
+            oclick_ok = result.get("ok", False)
+            print(f"  {'✅' if oclick_ok else '⚠️'} 오클릭: {'통과' if oclick_ok else result.get('error', '실패')}")
+    except Exception as e:
+        print(f"  ⚠️ 오클릭 검증 오류: {e}")
+        oclick_ok = True  # 오류 시 차단하지 않음
+
+    if naver_ok and oclick_ok:
+        print("  ✅ 자동 검증 완료 — 검증됨 상태로 변경됨")
+    else:
+        print("  ⚠️ 자동 검증 일부 실패 — Station에서 수동 확인 필요")
 
 
 # ── Config 로드 ────────────────────────────────
@@ -507,6 +629,17 @@ def handle_command(sb, command):
 
 
 # ── Heartbeat ─────────────────────────────────
+_current_ip: str | None = None
+_ip_last_fetched: float = 0.0
+
+def _refresh_ip_if_needed():
+    """30분마다 외부 IP 갱신"""
+    global _current_ip, _ip_last_fetched
+    now = time.time()
+    if now - _ip_last_fetched > 1800:
+        _current_ip = _get_external_ip()
+        _ip_last_fetched = now
+
 _heartbeat_status = {
     "status": "idle",
     "keyword": None,
@@ -592,15 +725,19 @@ def heartbeat(sb, status="idle", keyword=None, ctype=None):
     _heartbeat_status["status"] = status
     _heartbeat_status["keyword"] = keyword
     _heartbeat_status["ctype"] = ctype
+    _refresh_ip_if_needed()
     try:
-        sb.table("workers").update({
+        payload = {
             "last_seen": datetime.now(timezone.utc).isoformat(),
             "status": status,
             "version": VERSION,
             "current_keyword": keyword,
             "current_type": ctype,
             "allowed_types": _heartbeat_status["allowed_types"] or None,
-        }).eq("id", WORKER_ID).execute()
+        }
+        if _current_ip:
+            payload["current_ip"] = _current_ip
+        sb.table("workers").update(payload).eq("id", WORKER_ID).execute()
     except Exception:
         pass
 
@@ -609,13 +746,17 @@ async def _heartbeat_loop(sb, interval=10):
     while True:
         try:
             await asyncio.sleep(interval)
-            sb.table("workers").update({
+            _refresh_ip_if_needed()
+            payload = {
                 "last_seen": datetime.now(timezone.utc).isoformat(),
                 "status": _heartbeat_status["block_status"] and "blocked" or _heartbeat_status["status"],
                 "current_keyword": _heartbeat_status["keyword"],
                 "current_type": _heartbeat_status["ctype"],
                 "allowed_types": _heartbeat_status["allowed_types"] or None,
-            }).eq("id", WORKER_ID).execute()
+            }
+            if _current_ip:
+                payload["current_ip"] = _current_ip
+            sb.table("workers").update(payload).eq("id", WORKER_ID).execute()
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -768,6 +909,8 @@ async def process_request(sb, req, config, log_cb=None):
             # timeout은 재배분하지 않고 실패 처리 (네트워크 문제일 수 있음)
 
         if log_cb: log_cb(f"  ❌ 오류: {e}")
+        log_error(sb, f"[{req_type}] {keyword}: {e}", level="error",
+                  context={"keyword": keyword, "type": req_type, "request_id": req_id})
         sb.table("crawl_requests").update({
             "status": "failed",
             "error_message": str(e)[:500],
@@ -828,6 +971,9 @@ async def main():
     # 워커 ID 확인/생성
     ensure_worker_id()
 
+    # Watchdog 자동 등록 (Windows — 이미 등록된 경우 무시)
+    ensure_watchdog()
+
     try:
         from supabase import create_client
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -848,7 +994,8 @@ async def main():
     print(f"  지원: {', '.join(HANDLERS.keys())}")
     print("=" * 50)
 
-    if register_worker(sb):
+    registered, already_verified = register_worker(sb)
+    if registered:
         print("  ✅ CrawlStation에 등록 완료")
     else:
         print("  ⚠️ 등록 실패 — 오프라인 모드로 실행")
@@ -913,10 +1060,21 @@ async def main():
     else:
         print(f"  🌐 허용 타입: 전체 (oclick_sync 제외)")
 
+    # 시작 시 IP 조회 (이후 30분마다 자동 갱신)
+    _refresh_ip_if_needed()
+    if _current_ip:
+        print(f"  🌐 외부 IP: {_current_ip}")
+
     heartbeat(sb, "idle")
 
     # 백그라운드 heartbeat 시작 (10초마다 — 메인 루프 sleep 중에도 상태 유지)
     hb_task = asyncio.create_task(_heartbeat_loop(sb, interval=10))
+
+    # 미검증 워커 자동 검증 (최초 등록 또는 검증 이력 없는 경우)
+    _station_url = CRAWL_STATION_URL or "https://crawl-station.vercel.app"
+    if registered and not already_verified:
+        print("  🔍 미검증 워커 — 자동 검증 예약됨 (백그라운드)")
+        asyncio.create_task(_auto_verify_task(_station_url, WORKER_ID))
 
     # 내게 할당된 미처리 요청 처리 (타입 필터 적용)
     q = sb.table("crawl_requests").select("*") \
@@ -981,27 +1139,33 @@ async def main():
 
     print("\n👂 대기 중... (Ctrl+C 종료)")
 
+    global _last_update_check_time
     batch_count = 0
     loop_count = 0
     while True:
         try:
             loop_count += 1
 
-            # 주기적으로 원격 명령 + 업데이트 체크 (매 ~30초)
+            # 주기적으로 원격 명령 + config 체크 (매 ~30초)
             if loop_count % _UPDATE_CHECK_INTERVAL == 0:
                 # 원격 명령 체크
                 cmd = check_and_execute_command(sb)
                 if cmd:
                     handle_command(sb, cmd)
 
-                # 업데이트 체크
-                update = check_update(sb)
-                if update:
-                    print(f"\n  📦 새 버전 v{update['version']} 발견 — 자동 업데이트")
-                    apply_update(sb, update)
-
                 # config 주기적 재로드 (quota 등 반영)
                 config = load_config(sb)
+
+                # 업데이트 체크 (시간 기반 — config의 update_check_interval_minutes 참조)
+                update_interval_min = config.get("update_check_interval_minutes", 60)
+                now_ts = time.time()
+                if now_ts - _last_update_check_time >= update_interval_min * 60:
+                    _last_update_check_time = now_ts
+                    update = check_update(sb)
+                    if update:
+                        print(f"\n  📦 새 버전 v{update['version']} 발견 — 자동 업데이트")
+                        log_error(sb, f"업데이트: v{VERSION} → v{update['version']}", level="info")
+                        apply_update(sb, update)
 
             # ── 새벽 휴식 (KST 3~5시) ──
             kst_now = datetime.now(_KST)
@@ -1152,12 +1316,33 @@ async def main():
                         except Exception:
                             pass
             else:
-                await asyncio.sleep(5)
+                # ── 닥톡 송출 대기열 체크 (crawl_requests 없을 때) ──
+                try:
+                    from handlers.kin_post import KinPostHandler
+                    _kp = KinPostHandler(config=config)
+                    _kp_result = await _kp.poll_and_post(sb, WORKER_ID, log_cb=print)
+                    if _kp_result and _kp_result.get("success"):
+                        # 송출 완료 시 딜레이 (사람처럼)
+                        _kp_delay = random.randint(
+                            int(os.environ.get("KIN_POST_DELAY_MIN", "30")),
+                            int(os.environ.get("KIN_POST_DELAY_MAX", "90"))
+                        )
+                        print(f"  ⏳ 다음 송출까지 {_kp_delay}초 대기...")
+                        await asyncio.sleep(_kp_delay)
+                    else:
+                        await asyncio.sleep(5)
+                except Exception as _kpe:
+                    print(f"  ⚠️ KinPost 오류: {_kpe}")
+                    await asyncio.sleep(5)
 
         except KeyboardInterrupt:
             break
         except Exception as e:
             print(f"⚠️ {e}")
+            try:
+                log_error(sb, str(e), level="error", context={"loop_count": loop_count})
+            except Exception:
+                pass
             await asyncio.sleep(10)
 
     hb_task.cancel()
