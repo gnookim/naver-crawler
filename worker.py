@@ -39,7 +39,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.43"
+VERSION = "0.9.44"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Python 워커가 처리하지 않는 타입 (향후 확장용 — 현재는 모든 타입 처리 가능)
@@ -1190,27 +1190,39 @@ async def main():
                 await asyncio.sleep(60)
                 continue
 
-            # ── 일일 할당량 체크 ──
-            daily_quota = config.get("daily_quota", 500)
-            daily_used = config.get("daily_used", 0)
+            # ── 일일 할당량 체크 (카테고리별) ──
             quota_reset_at = config.get("quota_reset_at", "")
 
-            # KST 자정 리셋 체크
-            if quota_reset_at:
-                try:
-                    from datetime import date as _date
-                    reset_date = _date.fromisoformat(quota_reset_at[:10])
-                    kst_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
-                    if reset_date < kst_today:
-                        sb.rpc("reset_daily_quota_if_needed", {"wid": WORKER_ID}).execute()
-                        daily_used = 0
-                        config["daily_used"] = 0
-                except Exception:
-                    pass
+            # KST 자정 리셋
+            try:
+                from datetime import date as _date
+                kst_today = datetime.now(_KST).date()
+                reset_date = _date.fromisoformat(quota_reset_at[:10]) if quota_reset_at else None
+                if reset_date is None or reset_date < kst_today:
+                    sb.rpc("reset_daily_quotas", {"wid": WORKER_ID}).execute()
+                    for k in ("daily_used", "daily_used_naver", "daily_used_instagram"):
+                        config[k] = 0
+                    config["quota_reset_at"] = kst_today.isoformat()
+            except Exception:
+                pass
 
-            if daily_used >= daily_quota:
-                if loop_count % 12 == 1:  # 1분마다 로그
-                    print(f"  ⏸️ 일일 할당량 소진 ({daily_used}/{daily_quota}) — 대기 중")
+            # 네이버 한도 초과 여부 (요청 가져오기 전 체크용)
+            _quota_naver = config.get("daily_quota_naver", 0)
+            _used_naver  = config.get("daily_used_naver", 0)
+            _quota_insta = config.get("daily_quota_instagram", 0)
+            _used_insta  = config.get("daily_used_instagram", 0)
+            _quota_all   = config.get("daily_quota", 0)
+            _used_all    = config.get("daily_used", 0)
+
+            # 모든 카테고리 소진 여부 판단
+            _naver_full = _quota_naver > 0 and _used_naver >= _quota_naver
+            _insta_full = _quota_insta > 0 and _used_insta >= _quota_insta
+            _all_full   = _quota_all > 0 and _used_all >= _quota_all
+
+            if _all_full or (_naver_full and _insta_full):
+                if loop_count % 12 == 1:
+                    print(f"  ⏸️ 모든 카테고리 일일 한도 소진 — 대기 중 "
+                          f"(N {_used_naver}/{_quota_naver}, I {_used_insta}/{_quota_insta})")
                 await asyncio.sleep(60)
                 continue
 
@@ -1290,12 +1302,38 @@ async def main():
                     }).eq("id", task["id"]).execute()
 
             if task:
+                task_type = task.get("type", "")
+                # 카테고리 판별
+                _INSTA_TYPES = {"instagram_profile", "instagram_post", "instagram_login_test"}
+                _NAVER_TYPES = {"kin_analysis", "kin_post", "blog_crawl", "blog_serp",
+                                "area_analysis", "deep_analysis", "daily_rank", "rank_check"}
+                if task_type in _INSTA_TYPES:
+                    req_cat = "instagram"
+                elif task_type in _NAVER_TYPES:
+                    req_cat = "naver"
+                else:
+                    req_cat = "other"
+
+                # 카테고리별 한도 사전 체크 (이미 할당된 작업이라도 skip)
+                if req_cat == "naver" and _quota_naver > 0 and _used_naver >= _quota_naver:
+                    print(f"  ⏸️ 네이버 일일 한도 소진 ({_used_naver}/{_quota_naver}) — 작업 건너뜀")
+                    await asyncio.sleep(30)
+                    continue
+                if req_cat == "instagram" and _quota_insta > 0 and _used_insta >= _quota_insta:
+                    print(f"  ⏸️ 인스타 일일 한도 소진 ({_used_insta}/{_quota_insta}) — 작업 건너뜀")
+                    await asyncio.sleep(30)
+                    continue
+
                 await process_request(sb, task, config, log_cb=print)
                 batch_count += 1
 
-                # 일일 사용량 increment (atomic)
+                # 카테고리별 사용량 increment
                 try:
-                    sb.rpc("increment_daily_used", {"wid": WORKER_ID}).execute()
+                    sb.rpc("increment_daily_used_cat", {"wid": WORKER_ID, "cat": req_cat}).execute()
+                    if req_cat == "naver":
+                        config["daily_used_naver"] = config.get("daily_used_naver", 0) + 1
+                    elif req_cat == "instagram":
+                        config["daily_used_instagram"] = config.get("daily_used_instagram", 0) + 1
                     config["daily_used"] = config.get("daily_used", 0) + 1
                 except Exception as e:
                     print(f"  ⚠️ 할당량 증가 실패: {e}")
@@ -1305,23 +1343,30 @@ async def main():
                     print(f"\n  😴 배치 완료 — {rest}초 휴식")
                     await asyncio.sleep(rest)
                     batch_count = 0
-                    config = load_config(sb)  # config 재로드
-                    # IP 로테이션
+                    config = load_config(sb)
                     if should_rotate_ip(config):
                         rotate_tethering_ip(config, log_cb=print)
                 else:
-                    # 24시간 분산 딜레이 (daily_quota > 0이면 남은 시간/남은 할당량 기반)
-                    daily_quota = config.get("daily_quota", 0)
-                    daily_used  = config.get("daily_used", 0)
-                    if daily_quota > 0:
+                    # 24시간 분산 딜레이 — 카테고리별 한도 기준
+                    if req_cat == "naver" and _quota_naver > 0:
+                        _quota_ref = _quota_naver
+                        _used_ref  = config.get("daily_used_naver", 0)
+                    elif req_cat == "instagram" and _quota_insta > 0:
+                        _quota_ref = _quota_insta
+                        _used_ref  = config.get("daily_used_instagram", 0)
+                    else:
+                        _quota_ref = config.get("daily_quota", 0)
+                        _used_ref  = config.get("daily_used", 0)
+
+                    if _quota_ref > 0:
                         kst_now = datetime.now(_KST)
-                        secs_elapsed  = kst_now.hour * 3600 + kst_now.minute * 60 + kst_now.second
+                        secs_elapsed   = kst_now.hour * 3600 + kst_now.minute * 60 + kst_now.second
                         secs_remaining = max(86400 - secs_elapsed, 60)
-                        quota_remaining = max(daily_quota - daily_used, 1)
-                        base_interval = secs_remaining / quota_remaining
+                        quota_remaining = max(_quota_ref - _used_ref, 1)
+                        base_interval  = secs_remaining / quota_remaining
                         interval = int(base_interval * random.uniform(0.7, 1.3))
-                        interval = max(60, min(interval, 7200))  # 1분 ~ 2시간 범위
-                        print(f"  ⏱️ 24h 분산 대기: {interval//60}분 {interval%60}초 "
+                        interval = max(60, min(interval, 7200))
+                        print(f"  ⏱️ [{req_cat}] 24h 분산 대기: {interval//60}분 {interval%60}초 "
                               f"(잔여 {quota_remaining}건 / {secs_remaining//3600:.1f}h)")
                         await asyncio.sleep(interval)
                     else:
