@@ -39,7 +39,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.41"
+VERSION = "0.9.42"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Python 워커가 처리하지 않는 타입 (향후 확장용 — 현재는 모든 타입 처리 가능)
@@ -230,19 +230,32 @@ def register_worker(sb):
         existing = sb.table("workers").select("verified_at").eq("id", WORKER_ID).execute()
         already_verified = bool(existing.data and existing.data[0].get("verified_at"))
 
-        sb.table("workers").upsert({
-            "id": WORKER_ID,
-            "name": WORKER_NAME or info["hostname"],
-            "os": info["os"],
-            "hostname": info["hostname"],
-            "python_version": info["python_version"],
-            "version": VERSION,
-            "status": "online",
-            "last_seen": now,
-            "registered_at": now,
-            "registered_by": "auto",
-            "command": None,
-        }, on_conflict="id").execute()
+        if already_verified or (existing.data and existing.data[0]):
+            # 기존 워커 — name은 Station에서 수정한 값 유지, 기술 정보만 갱신
+            sb.table("workers").update({
+                "os": info["os"],
+                "hostname": info["hostname"],
+                "python_version": info["python_version"],
+                "version": VERSION,
+                "status": "online",
+                "last_seen": now,
+                "command": None,
+            }).eq("id", WORKER_ID).execute()
+        else:
+            # 최초 등록
+            sb.table("workers").insert({
+                "id": WORKER_ID,
+                "name": WORKER_NAME or info["hostname"],
+                "os": info["os"],
+                "hostname": info["hostname"],
+                "python_version": info["python_version"],
+                "version": VERSION,
+                "status": "online",
+                "last_seen": now,
+                "registered_at": now,
+                "registered_by": "auto",
+                "command": None,
+            }).execute()
         return True, already_verified
     except Exception as e:
         print(f"  ⚠️ 워커 등록 실패: {e}")
