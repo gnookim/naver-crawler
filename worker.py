@@ -39,7 +39,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.42"
+VERSION = "0.9.43"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Python 워커가 처리하지 않는 타입 (향후 확장용 — 현재는 모든 타입 처리 가능)
@@ -1310,9 +1310,24 @@ async def main():
                     if should_rotate_ip(config):
                         rotate_tethering_ip(config, log_cb=print)
                 else:
-                    delay_min = config.get("keyword_delay_min", 15)
-                    delay_max = config.get("keyword_delay_max", 30)
-                    await asyncio.sleep(random.randint(delay_min, delay_max))
+                    # 24시간 분산 딜레이 (daily_quota > 0이면 남은 시간/남은 할당량 기반)
+                    daily_quota = config.get("daily_quota", 0)
+                    daily_used  = config.get("daily_used", 0)
+                    if daily_quota > 0:
+                        kst_now = datetime.now(_KST)
+                        secs_elapsed  = kst_now.hour * 3600 + kst_now.minute * 60 + kst_now.second
+                        secs_remaining = max(86400 - secs_elapsed, 60)
+                        quota_remaining = max(daily_quota - daily_used, 1)
+                        base_interval = secs_remaining / quota_remaining
+                        interval = int(base_interval * random.uniform(0.7, 1.3))
+                        interval = max(60, min(interval, 7200))  # 1분 ~ 2시간 범위
+                        print(f"  ⏱️ 24h 분산 대기: {interval//60}분 {interval%60}초 "
+                              f"(잔여 {quota_remaining}건 / {secs_remaining//3600:.1f}h)")
+                        await asyncio.sleep(interval)
+                    else:
+                        delay_min = config.get("keyword_delay_min", 15)
+                        delay_max = config.get("keyword_delay_max", 30)
+                        await asyncio.sleep(random.randint(delay_min, delay_max))
 
                     # decoy 검색 (15% 확률 — 목적 없는 일반 검색으로 패턴 위장)
                     if random.random() < 0.15:
