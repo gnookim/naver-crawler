@@ -6,7 +6,7 @@ from .serp import BlogSerpHandler
 from .area import AreaAnalysisHandler
 from .deep import DeepAnalysisHandler
 from .rank import DailyRankHandler
-from .instagram import InstagramProfileHandler, InstagramLoginTestHandler
+from .instagram import InstagramProfileHandler
 
 try:
     from .instagram_post import InstagramPostHandler
@@ -28,7 +28,7 @@ HANDLERS = {
     "daily_rank": DailyRankHandler,
     "rank_check": DailyRankHandler,
     "instagram_profile": InstagramProfileHandler,
-    "instagram_login_test": InstagramLoginTestHandler,
+    "instagram_login_test": InstagramProfileHandler,
 }
 
 if InstagramPostHandler is not None:

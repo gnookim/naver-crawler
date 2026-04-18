@@ -7,6 +7,21 @@ import json
 import urllib.request
 import urllib.error
 import urllib.parse
+import ctypes
+import ctypes.util
+import socket
+
+
+def _refresh_dns():
+    """macOS 장시간 실행 시 DNS 리졸버가 stale해지는 문제 해결.
+    res_init()으로 /etc/resolv.conf를 재로드해 DNS 캐시를 초기화한다."""
+    try:
+        lib = ctypes.cdll.LoadLibrary(
+            ctypes.util.find_library("resolv") or "libresolv.dylib"
+        )
+        lib.res_init()
+    except Exception:
+        pass
 
 
 class SupabaseResponse:
@@ -153,7 +168,8 @@ class QueryBuilder:
         if self._body is not None:
             body = json.dumps(self._body).encode("utf-8")
 
-        try:
+        for _attempt in range(2):
+          try:
             req = urllib.request.Request(url, data=body, headers=headers, method=self._method)
             if self._head or self._count_only:
                 req.method = "HEAD" if self._head else self._method
@@ -176,15 +192,22 @@ class QueryBuilder:
                     return SupabaseResponse(data=None)
                 return SupabaseResponse(data=data if isinstance(data, list) else [data])
 
-        except urllib.error.HTTPError as e:
+          except socket.gaierror as e:
+            # DNS 조회 실패 (macOS 장시간 실행 시 stale resolver) — res_init() 후 1회 재시도
+            if _attempt == 0:
+                _refresh_dns()
+                continue
+            return SupabaseResponse(data=[], error=str(e)[:200])
+          except urllib.error.HTTPError as e:
             body_text = ""
             try:
                 body_text = e.read().decode("utf-8")[:200]
             except Exception:
                 pass
             return SupabaseResponse(data=[], error=f"HTTP {e.code}: {body_text}")
-        except Exception as e:
+          except Exception as e:
             return SupabaseResponse(data=[], error=str(e)[:200])
+        return SupabaseResponse(data=[], error="DNS 재시도 실패")
 
 
 class SupabaseREST:
@@ -216,10 +239,17 @@ class RPCBuilder:
             "Content-Type": "application/json",
         }
         body = json.dumps(self._params).encode("utf-8")
-        try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8")
-                return SupabaseResponse(data=json.loads(raw) if raw.strip() else [])
-        except Exception as e:
-            return SupabaseResponse(data=[], error=str(e)[:200])
+        for _attempt in range(2):
+            try:
+                req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    raw = resp.read().decode("utf-8")
+                    return SupabaseResponse(data=json.loads(raw) if raw.strip() else [])
+            except socket.gaierror:
+                if _attempt == 0:
+                    _refresh_dns()
+                    continue
+                return SupabaseResponse(data=[], error="DNS 재시도 실패")
+            except Exception as e:
+                return SupabaseResponse(data=[], error=str(e)[:200])
+        return SupabaseResponse(data=[], error="DNS 재시도 실패")
