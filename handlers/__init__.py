@@ -14,9 +14,10 @@ except ImportError:
     InstagramPostHandler = None  # type: ignore
 
 try:
-    from .oclick import OclickSyncHandler
+    from .oclick import OclickSyncHandler, OclickSalesHandler
 except ImportError:
-    OclickSyncHandler = None  # type: ignore
+    OclickSyncHandler = None   # type: ignore
+    OclickSalesHandler = None  # type: ignore
 
 HANDLERS = {
     "kin_analysis": KinHandler,
@@ -36,3 +37,6 @@ if InstagramPostHandler is not None:
 
 if OclickSyncHandler is not None:
     HANDLERS["oclick_sync"] = OclickSyncHandler
+
+if OclickSalesHandler is not None:
+    HANDLERS["oclick_sales"] = OclickSalesHandler

@@ -1,5 +1,5 @@
-"""Oclick 재고 동기화 핸들러
-admin.oclick.co.kr에 로그인 후 상품마스터 XML 데이터 전체 수집
+"""Oclick 재고 동기화 + 매출 수집 핸들러
+admin.oclick.co.kr에 로그인 후 XML 데이터 수집
 """
 import re
 import os
@@ -12,6 +12,8 @@ _SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 PAGE_SIZE = 500
 MAX_PAGES = 20  # 최대 10,000개
+SALES_PAGE_SIZE = 500
+SALES_MAX_PAGES = 40  # 최대 20,000건
 
 
 def _sb_headers():
@@ -171,4 +173,120 @@ class OclickSyncHandler(BaseCrawler):
             'in_PRTY': '', 'in_CNTPERBOX1': '', 'in_CNTPERBOX2': '', 'in_JAEGO': '', 'in_JAEGO1': '',
             'in_MEMO': '', 'in_VALSRC1': '', 'in_VALSRC2': '', 'in_PDETAIL': '', 'in_MADEIN': '',
             'in_IMGVIEW': 'N', 'op': op,
+        })
+
+
+class OclickSalesHandler(BaseCrawler):
+    """Oclick 매출 수집 핸들러 — /repo/OrdeMstSelect3.jsp XML API"""
+
+    async def handle(self, keyword, options, log_cb=None):
+        def log(msg):
+            if log_cb: log_cb(f"  [OclickSales] {msg}")
+
+        company_code, user_id, password = _load_credentials(options)
+        if not company_code or not user_id or not password:
+            raise ValueError("Oclick 자격증명 없음 — station_settings에 oclick_* 등록 필요")
+
+        # 날짜 정규화 (YYYY-MM-DD → YYYYMMDD)
+        start_date = (options.get('start_date') or '').replace('-', '')
+        end_date   = (options.get('end_date')   or '').replace('-', '')
+        if not start_date or not end_date:
+            from datetime import date, timedelta
+            today = date.today()
+            end_date   = today.strftime('%Y%m%d')
+            start_date = (today - timedelta(days=30)).strftime('%Y%m%d')
+
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as pw:
+            browser, ctx = await self.create_browser(pw)
+            page = await ctx.new_page()
+            orders = []
+
+            try:
+                # 1. 로그인
+                log("로그인 중...")
+                await page.goto('https://www.oclick.co.kr', wait_until='networkidle', timeout=20000)
+                await page.fill('#in_usercu', company_code)
+                await page.fill('#in_userid', user_id)
+                await page.fill('#in_passwd', password)
+                await page.click('button.bt_m_button01')
+                await page.wait_for_load_state('networkidle', timeout=15000)
+                if 'admin.oclick.co.kr' not in page.url:
+                    raise ValueError(f"로그인 실패: {page.url}")
+                log("로그인 성공")
+
+                # 2. 매출 페이지 → urlKey 추출
+                sales_url = (
+                    f"https://admin.oclick.co.kr/repo/OrdeMstSelect3.jsp"
+                    f"?in_SDATE={start_date}&in_EDATE={end_date}"
+                    f"&in_KORDE=Y&in_KCANC=N&in_KREFN=N&in_KCHAN=N&in_KLOST=N"
+                )
+                await page.goto(sales_url, wait_until='networkidle', timeout=20000)
+                content = await page.content()
+                m = re.search(r'urlKey=(\[[^\]]+\]\[[^\]]+\]\[\d+\]\[[^\]]+\])', content)
+                if not m:
+                    raise ValueError("urlKey를 찾을 수 없음 (세션 만료 또는 권한 없음)")
+                url_key = m.group(1)
+                log(f"urlKey 확인 ({start_date}~{end_date})")
+
+                # 3. 전체 건수 조회
+                info_params = self._build_sales_params(url_key, start_date, end_date, 1, 'info')
+                info_xml = await page.evaluate(
+                    "async (url) => (await fetch(url, {credentials:'same-origin'})).text()",
+                    f"https://admin.oclick.co.kr/repo/OrdeMstSelect3_xml.jsp?{info_params}"
+                )
+                total_match = re.search(r'total_count="(\d+)"|rows="(\d+)"', info_xml)
+                total_count = int(next((g for g in total_match.groups() if g), 0)) if total_match else 0
+                total_pages = min((total_count // SALES_PAGE_SIZE + 1) if total_count else SALES_MAX_PAGES, SALES_MAX_PAGES)
+                log(f"전체 건수: {total_count or '확인 중'}건")
+
+                # 4. 페이지 순회
+                for page_num in range(1, total_pages + 1):
+                    params = self._build_sales_params(url_key, start_date, end_date, page_num, 'select')
+                    xml_text = await page.evaluate(
+                        "async (url) => (await fetch(url, {credentials:'same-origin'})).text()",
+                        f"https://admin.oclick.co.kr/repo/OrdeMstSelect3_xml.jsp?{params}"
+                    )
+                    row_count = 0
+                    for row_m in re.finditer(r'<row[^>]*>([\s\S]*?)</row>', xml_text):
+                        cells = _parse_oclick_xml_cells(row_m.group(0))
+                        if len(cells) < 20:
+                            continue
+                        order_no = cells[3].strip()
+                        if not order_no:
+                            continue
+                        raw_qty    = cells[18].replace(',', '').replace('.', '') or '0'
+                        raw_amount = cells[19].replace(',', '').replace('.', '') or '0'
+                        order_date_raw = cells[7].strip()  # "20260417 14:20:53"
+                        orders.append({
+                            'order_no':     order_no,
+                            'order_date':   order_date_raw[:8] if order_date_raw else '',
+                            'channel':      cells[2].strip(),
+                            'order_status': cells[4].strip(),
+                            'sku':          cells[12].strip() or None,
+                            'product_name': cells[13].strip(),
+                            'qty':          int(raw_qty)    if raw_qty.isdigit()    else 0,
+                            'amount':       int(raw_amount) if raw_amount.isdigit() else 0,
+                        })
+                        row_count += 1
+
+                    log(f"{page_num}페이지: {row_count}건 (누적 {len(orders)}건)")
+                    if row_count < SALES_PAGE_SIZE:
+                        break
+
+                log(f"완료 — 총 {len(orders)}건")
+                return orders
+
+            finally:
+                await page.close()
+                await browser.close()
+
+    def _build_sales_params(self, url_key, start_date, end_date, page_num, op):
+        from urllib.parse import urlencode
+        return urlencode({
+            'in_SDATE': start_date, 'in_EDATE': end_date,
+            'in_KORDE': 'Y', 'in_KCANC': 'N', 'in_KREFN': 'N', 'in_KCHAN': 'N', 'in_KLOST': 'N',
+            'urlKey': url_key, 'in_PAGE_PG': str(page_num),
+            'in_PAGE_CNT': str(SALES_PAGE_SIZE), 'op': op,
         })
