@@ -86,11 +86,11 @@ class KinPostHandler(BaseCrawler):
                     break
 
         if not acct:
-            if log_cb: log_cb("  ⚠️ KinPost: 배정된 계정 없음")
-            return None
+            if log_cb: log_cb("  ⚠️ KinPost: 배정된 계정 없음 (5분 후 재확인)")
+            return {"no_account": True}
         if not acct.get("kinLoginId") or not acct.get("kinLoginPw"):
-            if log_cb: log_cb(f"  ⚠️ KinPost: 계정 {acct.get('name','?')}에 로그인 정보 없음")
-            return None
+            if log_cb: log_cb(f"  ⚠️ KinPost: 계정 {acct.get('name','?')}에 로그인 정보 없음 (5분 후 재확인)")
+            return {"no_account": True}
 
         # 2. 일일 한도 체크
         daily_limit = int(acct.get("dailyPostLimit") or 5)

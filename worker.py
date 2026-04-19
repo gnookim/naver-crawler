@@ -1402,6 +1402,9 @@ async def main():
                         )
                         print(f"  ⏳ 다음 송출까지 {_kp_delay}초 대기...")
                         await asyncio.sleep(_kp_delay)
+                    elif _kp_result and _kp_result.get("no_account"):
+                        # 배정 계정 없음 — 5분 후 재확인 (스팸 방지)
+                        await asyncio.sleep(300)
                     else:
                         await asyncio.sleep(5)
                 except Exception as _kpe:
