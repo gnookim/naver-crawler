@@ -39,7 +39,7 @@ except (ImportError, OSError):
     sys.modules["_greenlet"] = _fg
 
 # ── 버전 ──────────────────────────────────────
-VERSION = "0.9.45"
+VERSION = "0.9.46"
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Python 워커가 처리하지 않는 타입 (향후 확장용 — 현재는 모든 타입 처리 가능)
@@ -338,13 +338,17 @@ def load_config(sb):
 
 # ── IP 로테이션 (테더링) ─────────────────────────
 def _get_external_ip():
-    """외부 IP 주소를 조회 (실패 시 None)"""
-    try:
-        import urllib.request
-        with urllib.request.urlopen("https://api.ipify.org", timeout=10) as resp:
-            return resp.read().decode().strip()
-    except Exception:
-        return None
+    """외부 IP 주소를 조회 — 여러 서비스 순차 시도 (실패 시 None)"""
+    import urllib.request
+    for url in ["https://api.ipify.org", "https://checkip.amazonaws.com", "https://ifconfig.me/ip"]:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                ip = resp.read().decode().strip()
+                if ip:
+                    return ip
+        except Exception:
+            continue
+    return None
 
 
 def _get_windows_wifi_profile():
@@ -646,12 +650,15 @@ _current_ip: str | None = None
 _ip_last_fetched: float = 0.0
 
 def _refresh_ip_if_needed():
-    """30분마다 외부 IP 갱신"""
+    """IP 미확보 시 매 heartbeat 재시도, 확보 후 30분마다 갱신"""
     global _current_ip, _ip_last_fetched
     now = time.time()
-    if now - _ip_last_fetched > 1800:
-        _current_ip = _get_external_ip()
-        _ip_last_fetched = now
+    interval = 1800 if _current_ip else 0
+    if now - _ip_last_fetched > interval:
+        new_ip = _get_external_ip()
+        if new_ip:
+            _current_ip = new_ip
+            _ip_last_fetched = now
 
 _heartbeat_status = {
     "status": "idle",
